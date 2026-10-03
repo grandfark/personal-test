@@ -6,9 +6,13 @@ namespace MakeMusic;
 
 public sealed class AudioTrack(string name, string audioFilePath, TimeSpan duration) : INotifyPropertyChanged
 {
+    public const int TimelineBarCount = 32;
+    public const double PixelsPerBar = 24;
+
     private double _volume = 1;
     private bool _isMuted;
     private bool _isSolo;
+    private int _startBar = 1;
     private string? _audioFilePath = audioFilePath;
 
     public string Name { get; } = name;
@@ -16,6 +20,26 @@ public sealed class AudioTrack(string name, string audioFilePath, TimeSpan durat
     public string DurationLabel => Duration.ToString(@"m\:ss");
     public string AudioFileName => AudioFilePath is null ? "음원 경로 없음" : Path.GetFileName(AudioFilePath);
     public string AudioStatus => AudioFilePath is null ? "음원 경로 없음" : File.Exists(AudioFilePath) ? "오디오 연결됨" : "오디오 파일을 찾을 수 없음";
+    public double TimelineLeft => (StartBar - 1) * PixelsPerBar;
+    public double TimelineClipWidth => Math.Clamp(Duration.TotalSeconds * 12, PixelsPerBar, Math.Max(PixelsPerBar, TimelineBarCount * PixelsPerBar - TimelineLeft));
+
+    public int StartBar
+    {
+        get => _startBar;
+        set
+        {
+            var clampedValue = Math.Clamp(value, 1, TimelineBarCount);
+            if (_startBar == clampedValue)
+            {
+                return;
+            }
+
+            _startBar = clampedValue;
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(TimelineLeft));
+            OnPropertyChanged(nameof(TimelineClipWidth));
+        }
+    }
 
     public string? AudioFilePath
     {

@@ -234,12 +234,12 @@
                                           ToolTip="역할을 선택하거나 직접 입력하세요"
                                           LostFocus="InstrumentRolePicker_LostFocus" />
                             </DockPanel>
-                            <TextBlock Text="선택한 오디오 미리듣기" FontSize="11" Foreground="#AEBAB0" Margin="0,28,0,0" HorizontalAlignment="Center" />
+                            <TextBlock Text="타임라인 재생" FontSize="11" Foreground="#AEBAB0" Margin="0,28,0,0" HorizontalAlignment="Center" />
                             <TextBlock Text="{Binding SelectedAudioTrack.AudioFileName, TargetNullValue=프로젝트 관리에서 오디오를 가져오세요}" FontSize="10" Foreground="#7F9083" Margin="0,4,0,0" HorizontalAlignment="Center" />
                         </StackPanel>
                         <DockPanel Grid.Row="2" Margin="0,12,0,0">
                             <StackPanel Orientation="Horizontal">
-                                <Button Content="재생" Style="{StaticResource PrimaryButton}" Padding="12,6" Margin="6,0,0,0" Click="PlaySelectedAudio_Click" IsEnabled="{Binding CanPlaySelectedAudio}" />
+                                <Button Content="전체 재생" Style="{StaticResource PrimaryButton}" Padding="12,6" Margin="6,0,0,0" Click="PlayTimeline_Click" IsEnabled="{Binding CanPlayTimeline}" />
                                 <Button Content="정지" Style="{StaticResource ActionButton}" Padding="9,6" Margin="6,0,0,0" Click="StopAudio_Click" />
                             </StackPanel>
                             <TextBlock DockPanel.Dock="Right" Text="{Binding AudioStatus}" FontSize="10" Foreground="#AEBAB0" VerticalAlignment="Center" Margin="12,0,0,0" />
@@ -327,7 +327,6 @@
                     <Grid Grid.Column="2" Margin="12,0,0,0">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto" />
-                            <RowDefinition Height="24" />
                             <RowDefinition Height="*" />
                         </Grid.RowDefinitions>
                         <DockPanel>
@@ -336,30 +335,42 @@
                                 <TextBlock Text="  ·  타임라인" FontSize="10" Foreground="{StaticResource Muted}" VerticalAlignment="Center" />
                             </StackPanel>
                             <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                                <TextBlock Text="BPM" FontSize="9" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,5,0" />
+                                <TextBox Text="{Binding TempoBpm, UpdateSourceTrigger=LostFocus}" Width="48" Padding="4,3"
+                                         TextAlignment="Right" BorderBrush="{StaticResource Line}" BorderThickness="1" Margin="0,0,8,0"
+                                         ToolTip="템포: 40~240 BPM" />
                                 <TextBlock Text="WAV 오디오 트랙" FontSize="9" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,8,0" />
                                 <Button Content="선택 오디오 제거" Style="{StaticResource ActionButton}" Padding="6,3" FontSize="9"
                                         Click="RemoveSelectedAudioTrack_Click" IsEnabled="{Binding HasSelectedAudioTrack}" />
                             </StackPanel>
                         </DockPanel>
-                        <UniformGrid Grid.Row="1" Rows="1" Columns="8" Margin="98,3,0,0">
-                            <TextBlock Text="1" FontSize="9" Foreground="{StaticResource Muted}" />
-                            <TextBlock Text="5" FontSize="9" Foreground="{StaticResource Muted}" />
-                            <TextBlock Text="9" FontSize="9" Foreground="{StaticResource Muted}" />
-                            <TextBlock Text="13" FontSize="9" Foreground="{StaticResource Muted}" />
-                            <TextBlock Text="17" FontSize="9" Foreground="{StaticResource Muted}" />
-                            <TextBlock Text="21" FontSize="9" Foreground="{StaticResource Muted}" />
-                            <TextBlock Text="25" FontSize="9" Foreground="{StaticResource Muted}" />
-                            <TextBlock Text="29" FontSize="9" Foreground="{StaticResource Muted}" />
-                        </UniformGrid>
-                        <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                            <StackPanel>
+                        <TabControl Grid.Row="1">
+                            <TabItem Header="배치">
+                                <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
+                                    <StackPanel Width="866">
+                                <Grid Height="24">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="98" />
+                                        <ColumnDefinition Width="768" />
+                                    </Grid.ColumnDefinitions>
+                                    <UniformGrid Grid.Column="1" Rows="1" Columns="8">
+                                        <TextBlock Text="1" FontSize="9" Foreground="{StaticResource Muted}" />
+                                        <TextBlock Text="5" FontSize="9" Foreground="{StaticResource Muted}" />
+                                        <TextBlock Text="9" FontSize="9" Foreground="{StaticResource Muted}" />
+                                        <TextBlock Text="13" FontSize="9" Foreground="{StaticResource Muted}" />
+                                        <TextBlock Text="17" FontSize="9" Foreground="{StaticResource Muted}" />
+                                        <TextBlock Text="21" FontSize="9" Foreground="{StaticResource Muted}" />
+                                        <TextBlock Text="25" FontSize="9" Foreground="{StaticResource Muted}" />
+                                        <TextBlock Text="29" FontSize="9" Foreground="{StaticResource Muted}" />
+                                    </UniformGrid>
+                                </Grid>
                             <ItemsControl ItemsSource="{Binding InstrumentTracks}">
                                 <ItemsControl.ItemTemplate>
                                     <DataTemplate>
                                         <Grid Height="34">
                                             <Grid.ColumnDefinitions>
                                                 <ColumnDefinition Width="98" />
-                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="768" />
                                             </Grid.ColumnDefinitions>
                                             <Border BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0">
                                                 <TextBlock Text="{Binding Name}" FontSize="9" Foreground="{StaticResource Ink}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
@@ -379,29 +390,91 @@
                                 </ItemsControl.ItemTemplate>
                             </ItemsControl>
                             <ListBox ItemsSource="{Binding AudioTracks}" SelectedItem="{Binding SelectedAudioTrack, Mode=TwoWay}"
-                                     Background="Transparent" BorderThickness="0" Padding="0" Margin="0,4,0,0">
+                                     Background="Transparent" BorderThickness="0" Padding="0" Margin="0,4,0,0"
+                                     ScrollViewer.HorizontalScrollBarVisibility="Disabled" ScrollViewer.VerticalScrollBarVisibility="Disabled">
+                                <ListBox.ItemContainerStyle>
+                                    <Style TargetType="ListBoxItem">
+                                        <Setter Property="Padding" Value="0" />
+                                        <Setter Property="Margin" Value="0" />
+                                        <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                    </Style>
+                                </ListBox.ItemContainerStyle>
                                 <ListBox.ItemTemplate>
                                     <DataTemplate>
                                         <Grid Height="34">
                                             <Grid.ColumnDefinitions>
                                                 <ColumnDefinition Width="98" />
-                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="768" />
                                             </Grid.ColumnDefinitions>
                                             <Border BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0">
                                                 <TextBlock Text="{Binding Name}" FontSize="9" Foreground="{StaticResource Ink}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
                                             </Border>
-                                            <Border Grid.Column="1" Background="#DCEBF3" BorderBrush="#A7C8D7" BorderThickness="1" CornerRadius="3" Margin="2,3" Padding="7,0">
-                                                <DockPanel>
-                                                    <TextBlock Text="{Binding AudioFileName}" FontSize="9" FontWeight="SemiBold" Foreground="#274B5D" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
-                                                    <TextBlock DockPanel.Dock="Right" Text="{Binding DurationLabel}" FontSize="9" Foreground="#496A79" VerticalAlignment="Center" Margin="8,0,0,0" />
-                                                </DockPanel>
-                                            </Border>
+                                            <Canvas Grid.Column="1" Width="768" Height="34" ClipToBounds="True">
+                                                <UniformGrid Width="768" Height="34" Rows="1" Columns="8" IsHitTestVisible="False">
+                                                    <Border BorderBrush="{StaticResource Line}" BorderThickness="1,1,0,0" />
+                                                    <Border BorderBrush="{StaticResource Line}" BorderThickness="1,1,0,0" />
+                                                    <Border BorderBrush="{StaticResource Line}" BorderThickness="1,1,0,0" />
+                                                    <Border BorderBrush="{StaticResource Line}" BorderThickness="1,1,0,0" />
+                                                    <Border BorderBrush="{StaticResource Line}" BorderThickness="1,1,0,0" />
+                                                    <Border BorderBrush="{StaticResource Line}" BorderThickness="1,1,0,0" />
+                                                    <Border BorderBrush="{StaticResource Line}" BorderThickness="1,1,0,0" />
+                                                    <Border BorderBrush="{StaticResource Line}" BorderThickness="1,1,1,0" />
+                                                </UniformGrid>
+                                                <Border Canvas.Left="{Binding TimelineLeft}" Canvas.Top="3"
+                                                        Width="{Binding TimelineClipWidth}" Height="28"
+                                                        Background="#DCEBF3" BorderBrush="#78A9BF" BorderThickness="1" CornerRadius="3"
+                                                        Padding="7,0" Cursor="SizeAll" ToolTip="드래그하여 시작 마디 이동"
+                                                        MouseLeftButtonDown="AudioClip_MouseLeftButtonDown"
+                                                        MouseMove="AudioClip_MouseMove"
+                                                        MouseLeftButtonUp="AudioClip_MouseLeftButtonUp">
+                                                    <DockPanel>
+                                                        <TextBlock Text="{Binding AudioFileName}" FontSize="9" FontWeight="SemiBold" Foreground="#274B5D" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                                                        <TextBlock DockPanel.Dock="Right" Text="{Binding StartBar, StringFormat=마디 {0}}" FontSize="9" Foreground="#496A79" VerticalAlignment="Center" Margin="8,0,0,0" />
+                                                    </DockPanel>
+                                                </Border>
+                                            </Canvas>
                                         </Grid>
                                     </DataTemplate>
                                 </ListBox.ItemTemplate>
                             </ListBox>
-                                </StackPanel>
-                        </ScrollViewer>
+                                    </StackPanel>
+                                </ScrollViewer>
+                            </TabItem>
+                            <TabItem Header="음표 편집">
+                                <Grid Margin="8">
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="*" />
+                                    </Grid.RowDefinitions>
+                                    <DockPanel Margin="0,0,0,8">
+                                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                            <TextBlock Text="길이" FontSize="10" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,5,0" />
+                                            <ComboBox x:Name="NoteLengthPicker" Width="76" SelectedIndex="2" Padding="4,2"
+                                                      SelectionChanged="NoteLengthPicker_SelectionChanged">
+                                                <ComboBoxItem Content="1/16" Tag="1" />
+                                                <ComboBoxItem Content="1/8" Tag="2" />
+                                                <ComboBoxItem Content="1/4" Tag="4" />
+                                                <ComboBoxItem Content="1/2" Tag="8" />
+                                                <ComboBoxItem Content="1마디" Tag="16" />
+                                            </ComboBox>
+                                            <TextBlock Text="세기" FontSize="10" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="12,0,5,0" />
+                                            <Slider x:Name="NoteVelocitySlider" Width="110" Minimum="1" Maximum="127" Value="100"
+                                                    VerticalAlignment="Center" ValueChanged="NoteVelocitySlider_ValueChanged" />
+                                            <TextBlock x:Name="NoteVelocityValue" Text="100" FontSize="10" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="5,0,0,0" />
+                                            <TextBlock x:Name="SelectedNoteSummary" Text="음표 선택 없음" FontSize="10" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="12,0,0,0" />
+                                        </StackPanel>
+                                        <Button DockPanel.Dock="Right" Content="선택 음표 삭제" Style="{StaticResource ActionButton}" Padding="7,4"
+                                                Click="DeleteSelectedNote_Click" IsEnabled="{Binding HasSelectedNote}" />
+                                    </DockPanel>
+                                    <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
+                                        <Canvas x:Name="PianoRollCanvas" Background="#FFFFFF"
+                                                Width="6192" Height="456"
+                                                IsEnabled="{Binding HasSelectedTrack}"
+                                                MouseLeftButtonDown="PianoRollCanvas_MouseLeftButtonDown" />
+                                    </ScrollViewer>
+                                </Grid>
+                            </TabItem>
+                        </TabControl>
                     </Grid>
                 </Grid>
             </Border>
