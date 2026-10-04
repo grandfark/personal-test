@@ -379,7 +379,7 @@
                                         Click="RemoveSelectedAudioTrack_Click" IsEnabled="{Binding HasSelectedAudioTrack}" />
                             </StackPanel>
                         </DockPanel>
-                        <TabControl Grid.Row="1">
+                        <TabControl x:Name="ScoreEditorTabs" Grid.Row="1">
                             <TabItem Header="배치">
                                 <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
                                     <StackPanel Width="866">
@@ -475,45 +475,70 @@
                                     </StackPanel>
                                 </ScrollViewer>
                             </TabItem>
-                            <TabItem Header="악보 편집">
+                            <TabItem x:Name="ScoreEditorTabItem" Header="악보 편집">
                                 <Grid Margin="8">
                                     <Grid.RowDefinitions>
                                         <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
                                         <RowDefinition Height="*" />
+                                        <RowDefinition Height="Auto" />
                                     </Grid.RowDefinitions>
-                                    <DockPanel Margin="0,0,0,8">
+                                    <DockPanel Grid.Row="0" Margin="0,0,0,6">
                                         <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                                             <TextBlock Text="임시표" FontSize="10" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,5,0" />
-                                            <ComboBox x:Name="AccidentalPicker" Width="64" SelectedIndex="0" Padding="4,2" Margin="0,0,10,0">
+                                            <ComboBox x:Name="AccidentalPicker" Width="64" SelectedIndex="0" Padding="4,2" Margin="0,0,8,0"
+                                                      SelectionChanged="AccidentalPicker_SelectionChanged">
                                                 <ComboBoxItem Content="없음" Tag="0" />
                                                 <ComboBoxItem Content="♯" Tag="1" />
+                                                <ComboBoxItem Content="♭" Tag="-1" />
                                             </ComboBox>
-                                            <TextBlock Text="길이" FontSize="10" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,5,0" />
-                                            <ComboBox x:Name="NoteLengthPicker" Width="76" SelectedIndex="2" Padding="4,2"
+                                            <TextBlock Text="음 길이" FontSize="10" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,5,0" />
+                                            <ComboBox x:Name="NoteLengthPicker" Width="84" SelectedIndex="2" Padding="4,2"
                                                       SelectionChanged="NoteLengthPicker_SelectionChanged">
                                                 <ComboBoxItem Content="1/16" Tag="1" />
                                                 <ComboBoxItem Content="1/8" Tag="2" />
                                                 <ComboBoxItem Content="1/4" Tag="4" />
                                                 <ComboBoxItem Content="1/2" Tag="8" />
                                                 <ComboBoxItem Content="1마디" Tag="16" />
+                                                <ComboBoxItem Content="2마디 장음" Tag="32" />
+                                                <ComboBoxItem Content="4마디 장음" Tag="64" />
                                             </ComboBox>
+                                            <ComboBox x:Name="ArticulationPicker" Width="74" SelectedIndex="0" Padding="4,2" Margin="8,0,0,0"
+                                                      SelectionChanged="ArticulationPicker_SelectionChanged">
+                                                <ComboBoxItem Content="보통" Tag="Normal" />
+                                                <ComboBoxItem Content="장음" Tag="Tenuto" />
+                                                <ComboBoxItem Content="단음" Tag="Staccato" />
+                                            </ComboBox>
+                                            <CheckBox x:Name="SlurSelectionToggle" Content="이음줄" FontSize="10" Foreground="{StaticResource Muted}"
+                                                      VerticalAlignment="Center" Margin="10,0,0,0" IsEnabled="{Binding HasSelectedNote}"
+                                                      Checked="SlurSelection_Changed" Unchecked="SlurSelection_Changed"
+                                                      ToolTip="두 개 이상의 음표를 선택하고 연결합니다." />
                                             <TextBlock Text="세기" FontSize="10" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="12,0,5,0" />
                                             <Slider x:Name="NoteVelocitySlider" Width="110" Minimum="1" Maximum="127" Value="100"
                                                     VerticalAlignment="Center" ValueChanged="NoteVelocitySlider_ValueChanged" />
                                             <TextBlock x:Name="NoteVelocityValue" Text="100" FontSize="10" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="5,0,0,0" />
                                             <TextBlock x:Name="SelectedNoteSummary" Text="음표 없음" FontSize="10" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="12,0,0,0" />
                                         </StackPanel>
-                                        <Button DockPanel.Dock="Right" Content="선택 음표 삭제" Style="{StaticResource ActionButton}" Padding="7,4"
-                                                Click="DeleteSelectedNote_Click" IsEnabled="{Binding HasSelectedNote}" />
                                     </DockPanel>
-                                    <TextBlock Grid.Row="1" Text="오선을 클릭해 음표를 추가하세요 · 가로는 박자, 세로는 음높이입니다. 재생은 상단 버튼을 누르세요."
-                                               FontSize="9" Foreground="{StaticResource Muted}" Margin="2,0,0,4" />
-                                    <ScrollViewer Grid.Row="1" Margin="0,18,0,0" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
+                                    <ContentControl x:Name="ScoreDockHost" Grid.Row="2" AllowDrop="True"
+                                                    PreviewDragOver="DockPanelHost_PreviewDragOver" PreviewDrop="DockPanelHost_PreviewDrop">
+                                      <ScrollViewer
+                                                  HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
                                         <Canvas x:Name="ScoreCanvas" Background="#FFFFFF"
-                                                Width="6192" Height="320"
+                                                Width="660" Height="320"
                                                 IsEnabled="{Binding HasSelectedTrack}"
-                                                MouseLeftButtonDown="ScoreCanvas_MouseLeftButtonDown" />
-                                    </ScrollViewer>
+                                                MouseLeftButtonDown="ScoreCanvas_MouseLeftButtonDown"
+                                                Focusable="True" KeyDown="ScoreCanvas_KeyDown"
+                                                MouseMove="ScoreCanvas_MouseMove" MouseLeftButtonUp="ScoreCanvas_MouseLeftButtonUp" />
+                                      </ScrollViewer>
+                                    </ContentControl>
+                                    <DockPanel Grid.Row="3" Margin="2,7,2,0" LastChildFill="True">
+                                        <TextBlock x:Name="ScorePageLabel" Text="마디 1–4" FontSize="10" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,12,0" />
+                                        <TextBlock DockPanel.Dock="Right" Text="악보를 좌우로 이동 · Ctrl+클릭 추가 선택 · Delete 삭제" FontSize="9" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="12,0,0,0" />
+                                        <Slider x:Name="ScorePageSlider" MinWidth="220" Maximum="7" Value="0" SmallChange="1" LargeChange="1"
+                                                IsSnapToTickEnabled="True" TickFrequency="1" VerticalAlignment="Center" ToolTip="드래그하여 4마디 단위로 이동"
+                                                ValueChanged="ScorePageSlider_ValueChanged" />
+                                    </DockPanel>
                                 </Grid>
                             </TabItem>
                         </TabControl>

@@ -11,6 +11,7 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using Ellipse = System.Windows.Shapes.Ellipse;
+using Rectangle = System.Windows.Shapes.Rectangle;
 using System.Windows.Threading;
 using Microsoft.Win32;
 using NAudio.Wave;
@@ -24,14 +25,23 @@ namespace MakeMusic;
 public partial class MainWindow : Window
 {
     private static readonly string[] BuiltInInstrumentRoles = ["주선율", "보조선율", "화음", "저음", "리듬"];
-    private const int PianoRollLowestPitch = 60;
+    private const int PianoRollLowestPitch = 48;
     private const int PianoRollHighestPitch = 83;
     private const int StepsPerBeat = 4;
     private const int StepsPerBar = 16;
     private const double PianoRollStepWidth = 12;
     private const double PianoRollPitchLabelWidth = 48;
+    private const int BarsPerScorePage = 4;
+    private const int SystemsPerScorePage = 6;
+    private const int BarsPerScoreSheet = BarsPerScorePage * SystemsPerScorePage;
+    private const int StepsPerScoreSheet = BarsPerScoreSheet * StepsPerBar;
+    private const double ScoreSystemHeight = 250;
+    private const double GrandStaffGap = 140;
+    private const int ScorePageCount = (AudioTrack.TimelineBarCount + BarsPerScoreSheet - 1) / BarsPerScoreSheet;
+    private const double ScorePageLeft = 48;
+    private const double ScorePageStepWidth = 36;
     private const int AudioOutputSampleRate = 44100;
-    private static readonly int[] NoteLengthOptions = [1, 2, 4, 8, 16];
+    private static readonly int[] NoteLengthOptions = [1, 2, 4, 8, 16, 32, 64];
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -62,16 +72,37 @@ public partial class MainWindow : Window
     private Point _dockDragStartPoint;
     private readonly Dictionary<string, UIElement> _dockPanels = new(StringComparer.Ordinal);
     private bool _isUpdatingNoteControls;
+    private int _scorePageIndex;
+    private bool UsesGrandStaff => SelectedTrack?.InstrumentType == "피아노";
+    private string PrimaryClef => SelectedTrack?.InstrumentType is "베이스" or "첼로" ? "Bass" : "Treble";
+    private int VisibleSystemsOnPage => Math.Clamp(
+        (AudioTrack.TimelineBarCount - _scorePageIndex * BarsPerScoreSheet + BarsPerScorePage - 1) / BarsPerScorePage,
+        1,
+        SystemsPerScorePage);
+    private readonly UIElement? _scoreEditorContent;
+    private readonly HashSet<MusicalNote> _selectedNotes = [];
+    private Point _scoreDragStart;
+    private bool _isSelectingNotes;
+    private bool _isMovingNotes;
+    private bool _scoreDragMoved;
+    private bool _isUpdatingScorePageSlider;
+    private MusicalNote? _draggedNote;
+    private Rectangle? _noteSelectionRectangle;
+    private Dictionary<MusicalNote, (int StartStep, int Pitch)> _noteDragOrigins = [];
+    private bool _pendingNoteEntry;
+    private int _pendingNotePitch;
+    private int _pendingNoteStartStep;
 
     public MainWindow()
     {
         InitializeComponent();
         DataContext = this;
+        ScorePageSlider.Maximum = ScorePageCount - 1;
+        _scoreEditorContent = ScoreDockHost.Content as UIElement;
         _dockPanels["Project"] = (UIElement)ProjectPanelHost.Content;
         _dockPanels["Instrument"] = (UIElement)InstrumentPanelHost.Content;
         _dockPanels["Mixer"] = (UIElement)MixerPanelHost.Content;
         _dockPanels["Results"] = (UIElement)ResultsPanelHost.Content;
-        RestoreDockLayout();
         _transportTimer.Tick += TransportTimer_Tick;
         InstrumentTracks.CollectionChanged += InstrumentTracks_CollectionChanged;
         AudioTracks.CollectionChanged += AudioTracks_CollectionChanged;
@@ -79,6 +110,40 @@ public partial class MainWindow : Window
         InstrumentTracks.Add(new InstrumentTrack("피아노", "피아노"));
         SelectedTrack = InstrumentTracks[0];
         IsDirty = false;
+        Loaded += MainWindow_Loaded;
+    }
+
+    private void MainWindow_Loaded(object sender, RoutedEventArgs e)
+    {
+        Loaded -= MainWindow_Loaded;
+        RestoreLastProject();
+    }
+
+    private void RestoreLastProject()
+    {
+        string path;
+        try
+        {
+            if (!File.Exists(LastProjectFilePath))
+            {
+                return;
+            }
+
+            path = File.ReadAllText(LastProjectFilePath).Trim();
+            if (path.Length == 0 || !File.Exists(path))
+            {
+                return;
+            }
+
+            var document = ReadProject(path);
+            ApplyProject(document, path);
+            CurrentProjectPath = path;
+            IsDirty = false;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or InvalidDataException or NotSupportedException or ArgumentException)
+        {
+            MessageBox.Show(this, $"마지막 프로젝트를 열 수 없습니다.\n{exception.Message}", "프로젝트 열기 오류", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
     }
 
     public ObservableCollection<InstrumentTrack> InstrumentTracks { get; } = [];
@@ -149,6 +214,7 @@ public partial class MainWindow : Window
 
             _selectedTrack = value;
             SelectedNote = null;
+            _selectedNotes.Clear();
             OnPropertyChanged();
             OnPropertyChanged(nameof(HasSelectedTrack));
             RenderScore();
@@ -168,6 +234,11 @@ public partial class MainWindow : Window
             }
 
             _selectedNote = value;
+            _selectedNotes.Clear();
+            if (value is not null)
+            {
+                _selectedNotes.Add(value);
+            }
             OnPropertyChanged();
             OnPropertyChanged(nameof(HasSelectedNote));
             UpdateSelectedNoteControls();
@@ -428,15 +499,7 @@ public partial class MainWindow : Window
         ProjectDocument document;
         try
         {
-            if (!string.Equals(Path.GetExtension(dialog.FileName), ".mmproj", StringComparison.OrdinalIgnoreCase))
-            {
-                throw new InvalidDataException("프로젝트 파일은 .mmproj 형식만 열 수 있습니다.");
-            }
-
-            var json = File.ReadAllText(dialog.FileName);
-            document = JsonSerializer.Deserialize<ProjectDocument>(json, JsonOptions)
-                ?? throw new InvalidDataException("프로젝트 파일에 내용이 없습니다.");
-            ValidateProject(document, dialog.FileName);
+            document = ReadProject(dialog.FileName);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or InvalidDataException or NotSupportedException)
         {
@@ -451,8 +514,41 @@ public partial class MainWindow : Window
 
         ApplyProject(document, dialog.FileName);
         CurrentProjectPath = dialog.FileName;
+        RememberLastProject(dialog.FileName);
         IsDirty = false;
     }
+
+    private static ProjectDocument ReadProject(string path)
+    {
+        if (!string.Equals(Path.GetExtension(path), ".mmproj", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("프로젝트 파일은 .mmproj 형식만 열 수 있습니다.");
+        }
+
+        var json = File.ReadAllText(path);
+        var document = JsonSerializer.Deserialize<ProjectDocument>(json, JsonOptions)
+            ?? throw new InvalidDataException("프로젝트 파일에 내용이 없습니다.");
+        ValidateProject(document, path);
+        return document;
+    }
+
+    private static void RememberLastProject(string path)
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(LastProjectFilePath)!);
+            File.WriteAllText(LastProjectFilePath, Path.GetFullPath(path));
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            // The project remains usable even if the recent-project preference cannot be written.
+        }
+    }
+
+    private static string LastProjectFilePath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "MakeMusic",
+        "last-project.txt");
 
     private bool SaveProject()
     {
@@ -504,7 +600,9 @@ public partial class MainWindow : Window
                         Pitch = note.Pitch,
                         StartStep = note.StartStep,
                         LengthSteps = note.LengthSteps,
-                        Velocity = note.Velocity
+                        Velocity = note.Velocity,
+                        Articulation = note.Articulation,
+                        IsSlurredToNext = note.IsSlurredToNext
                     }).ToList()
                 }).ToList(),
                 AudioTracks = AudioTracks.Select(track => new AudioTrackDocument
@@ -522,6 +620,7 @@ public partial class MainWindow : Window
             var json = JsonSerializer.Serialize(document, JsonOptions);
             File.WriteAllText(path, json);
             CurrentProjectPath = path;
+            RememberLastProject(path);
             IsDirty = false;
             return true;
         }
@@ -558,7 +657,11 @@ public partial class MainWindow : Window
 
                 foreach (var noteDocument in trackDocument.Notes ?? [])
                 {
-                    instrumentTrack.Notes.Add(new MusicalNote(noteDocument.Pitch, noteDocument.StartStep, noteDocument.LengthSteps, noteDocument.Velocity));
+                    instrumentTrack.Notes.Add(new MusicalNote(noteDocument.Pitch, noteDocument.StartStep, noteDocument.LengthSteps, noteDocument.Velocity)
+                    {
+                        Articulation = noteDocument.Articulation,
+                        IsSlurredToNext = noteDocument.IsSlurredToNext
+                    });
                 }
 
                 InstrumentTracks.Add(instrumentTrack);
@@ -668,7 +771,7 @@ public partial class MainWindow : Window
 
             foreach (var note in track.Notes)
             {
-                if (note is null || note.Pitch is < 60 or > 83 || note.StartStep is < 0 or >= AudioTrack.TimelineBarCount * 16 ||
+                if (note is null || note.Pitch is < 48 or > 83 || note.StartStep is < 0 or >= AudioTrack.TimelineBarCount * 16 ||
                     note.LengthSteps is < 1 or > AudioTrack.TimelineBarCount * 16 || note.StartStep + note.LengthSteps > AudioTrack.TimelineBarCount * 16 ||
                     note.Velocity is < 1 or > 127)
                 {
@@ -800,6 +903,8 @@ public partial class MainWindow : Window
             return;
         }
 
+        _scorePageIndex = Math.Clamp((PlayheadBar - 1) / BarsPerScoreSheet, 0, ScorePageCount - 1);
+        RenderScore();
         StopPlayback("재생 준비");
         try
         {
@@ -860,9 +965,27 @@ public partial class MainWindow : Window
                     continue;
                 }
 
-                foreach (var note in track.Notes)
+                var orderedNotes = track.Notes.OrderBy(note => note.StartStep).ToList();
+                for (var noteIndex = 0; noteIndex < orderedNotes.Count; noteIndex++)
                 {
-                    var duration = TimeSpan.FromSeconds(note.LengthSteps * secondsPerStep);
+                    var note = orderedNotes[noteIndex];
+                    var articulationScale = note.Articulation == "Staccato" ? 0.4 : note.Articulation == "Tenuto" ? 2d : 1d;
+                    var sustainedSteps = note.LengthSteps;
+                    var lastTiedIndex = noteIndex;
+                    while (orderedNotes[lastTiedIndex].IsSlurredToNext && lastTiedIndex + 1 < orderedNotes.Count)
+                    {
+                        var nextNote = orderedNotes[lastTiedIndex + 1];
+                        if (nextNote.Pitch != note.Pitch || nextNote.StartStep != note.StartStep + sustainedSteps)
+                        {
+                            break;
+                        }
+
+                        sustainedSteps += nextNote.LengthSteps;
+                        lastTiedIndex++;
+                    }
+
+                    var overlapSeconds = lastTiedIndex == noteIndex && note.IsSlurredToNext ? 0.035 : 0;
+                    var duration = TimeSpan.FromSeconds(sustainedSteps * secondsPerStep * articulationScale + overlapSeconds);
                     var delay = TimeSpan.FromSeconds(note.StartStep * secondsPerStep);
                     var semitonesFromA4 = note.Pitch - 69 + MasterFineTuneCents / 100d;
                     var frequency = MasterReferencePitch * Math.Pow(2, semitonesFromA4 / 12d);
@@ -873,6 +996,7 @@ public partial class MainWindow : Window
                         duration);
                     mixer.AddMixerInput(new OffsetSampleProvider(tone) { DelayBy = delay });
                     scheduledTrackCount++;
+                    noteIndex = lastTiedIndex;
                 }
             }
 
@@ -1104,27 +1228,43 @@ public partial class MainWindow : Window
         }
 
         var position = e.GetPosition(ScoreCanvas);
-        const double scoreLeft = 52;
-        const double staffBottom = 220;
-        const double staffStepHeight = 12;
-        if (position.X < scoreLeft || position.Y < 50 || position.Y > 270)
+        _pendingNoteEntry = false;
+        if (e.OriginalSource is Canvas && Keyboard.Modifiers == ModifierKeys.None)
         {
-            return;
+            var visibleSteps = BarsPerScorePage * StepsPerBar;
+            var localStep = (int)((position.X - ScorePageLeft) / ScorePageStepWidth);
+            var systemIndex = (int)(position.Y / ScoreSystemHeight);
+            if (localStep >= 0 && localStep < visibleSteps && systemIndex >= 0 && systemIndex < VisibleSystemsOnPage)
+            {
+                var startStep = _scorePageIndex * StepsPerScoreSheet + systemIndex * visibleSteps + localStep;
+                const double staffBottom = 145;
+                const double staffStepHeight = 10;
+                var systemY = systemIndex * ScoreSystemHeight;
+                var localY = position.Y - systemY;
+                var inputClef = UsesGrandStaff && localY >= 175 ? "Bass" : PrimaryClef;
+                var inputStaffBottom = (inputClef == "Bass" && UsesGrandStaff ? staffBottom + GrandStaffGap : staffBottom) + systemY;
+                var diatonicStep = (int)Math.Round((inputStaffBottom - position.Y) / staffStepHeight);
+                var pitch = DiatonicStepToMidi(diatonicStep, inputClef) + SelectedAccidentalOffset;
+                var totalSteps = AudioTrack.TimelineBarCount * StepsPerBar;
+                var minimumPitch = PianoRollLowestPitch;
+                var validStaff = position.Y >= inputStaffBottom - 80 - 8 && position.Y <= inputStaffBottom + 8;
+                if (validStaff && pitch >= minimumPitch && pitch <= PianoRollHighestPitch && startStep < totalSteps)
+                {
+                    _pendingNoteEntry = true;
+                    _pendingNotePitch = pitch;
+                    _pendingNoteStartStep = startStep;
+                }
+            }
         }
 
-        var totalSteps = AudioTrack.TimelineBarCount * StepsPerBar;
-        var startStep = (int)((position.X - scoreLeft) / PianoRollStepWidth);
-        var diatonicStep = (int)Math.Round((staffBottom - position.Y) / staffStepHeight);
-        var pitch = DiatonicStepToMidi(diatonicStep) + SelectedAccidentalOffset;
-        if (startStep < 0 || startStep >= totalSteps || pitch is < PianoRollLowestPitch or > PianoRollHighestPitch)
-        {
-            return;
-        }
-
-        var length = Math.Min(SelectedNoteLengthSteps, totalSteps - startStep);
-        var note = new MusicalNote(pitch, startStep, length, (int)Math.Round(NoteVelocitySlider.Value));
-        SelectedTrack.Notes.Add(note);
-        SelectedNote = note;
+        _scoreDragStart = position;
+        _scoreDragMoved = false;
+        _isSelectingNotes = true;
+        _noteSelectionRectangle = new Rectangle { Stroke = Brushes.SeaGreen, StrokeThickness = 1, Fill = new SolidColorBrush(Color.FromArgb(35, 46, 139, 87)), IsHitTestVisible = false };
+        Canvas.SetLeft(_noteSelectionRectangle, position.X);
+        Canvas.SetTop(_noteSelectionRectangle, position.Y);
+        ScoreCanvas.Children.Add(_noteSelectionRectangle);
+        ScoreCanvas.CaptureMouse();
         e.Handled = true;
     }
 
@@ -1132,8 +1272,172 @@ public partial class MainWindow : Window
     {
         if (sender is FrameworkElement { DataContext: MusicalNote note })
         {
-            SelectedNote = note;
+            if (SelectedTrack is null)
+            {
+                return;
+            }
+
+            if (e.ChangedButton == MouseButton.Right)
+            {
+                SelectedTrack.Notes.Remove(note);
+                if (ReferenceEquals(SelectedNote, note))
+                {
+                    SelectedNote = null;
+                }
+                e.Handled = true;
+                return;
+            }
+
+            if (Keyboard.Modifiers.HasFlag(ModifierKeys.Control))
+            {
+                if (!_selectedNotes.Remove(note))
+                {
+                    _selectedNotes.Add(note);
+                    _selectedNote = note;
+                }
+                else if (ReferenceEquals(_selectedNote, note))
+                {
+                    _selectedNote = _selectedNotes.LastOrDefault();
+                }
+            }
+            else if (!_selectedNotes.Contains(note))
+            {
+                _selectedNotes.Clear();
+                _selectedNotes.Add(note);
+                _selectedNote = note;
+            }
+
+            OnPropertyChanged(nameof(HasSelectedNote));
+            UpdateSelectedNoteControls();
+            RenderScore();
+            ScoreCanvas.Focus();
+            _draggedNote = note;
+            _scoreDragStart = e.GetPosition(ScoreCanvas);
+            _scoreDragMoved = false;
+            _isMovingNotes = true;
+            ScoreCanvas.CaptureMouse();
             e.Handled = true;
+        }
+    }
+
+    private void ScoreCanvas_MouseMove(object sender, MouseEventArgs e)
+    {
+        if (e.LeftButton != MouseButtonState.Pressed || SelectedTrack is null)
+        {
+            return;
+        }
+
+        var position = e.GetPosition(ScoreCanvas);
+        var movedHorizontally = Math.Abs(position.X - _scoreDragStart.X) > 4;
+        var movedVertically = Math.Abs(position.Y - _scoreDragStart.Y) > 4;
+        if (!_scoreDragMoved && (_isMovingNotes ? movedHorizontally : movedHorizontally || movedVertically))
+        {
+            _scoreDragMoved = true;
+            if (_isMovingNotes && SelectedTrack is not null)
+            {
+                _noteDragOrigins = _selectedNotes.ToDictionary(note => note, note => (note.StartStep, note.Pitch));
+            }
+        }
+
+        if (!_scoreDragMoved)
+        {
+            return;
+        }
+
+        if (_isMovingNotes && _draggedNote is not null)
+        {
+            var horizontalSteps = (int)Math.Round((position.X - _scoreDragStart.X) / ScorePageStepWidth);
+            var totalSteps = AudioTrack.TimelineBarCount * StepsPerBar;
+            foreach (var entry in _noteDragOrigins)
+            {
+                entry.Key.StartStep = Math.Clamp(entry.Value.StartStep + horizontalSteps, 0, totalSteps - entry.Key.LengthSteps);
+            }
+        }
+        else if (_isSelectingNotes && _noteSelectionRectangle is not null)
+        {
+            var left = Math.Min(_scoreDragStart.X, position.X);
+            var top = Math.Min(_scoreDragStart.Y, position.Y);
+            _noteSelectionRectangle.Width = Math.Abs(position.X - _scoreDragStart.X);
+            _noteSelectionRectangle.Height = Math.Abs(position.Y - _scoreDragStart.Y);
+            Canvas.SetLeft(_noteSelectionRectangle, left);
+            Canvas.SetTop(_noteSelectionRectangle, top);
+        }
+    }
+
+    private void ScoreCanvas_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+    {
+        if (_isSelectingNotes && _noteSelectionRectangle is not null && _scoreDragMoved && SelectedTrack is not null)
+        {
+            var rectangle = _noteSelectionRectangle;
+            var left = Canvas.GetLeft(rectangle);
+            var top = Canvas.GetTop(rectangle);
+            var right = left + rectangle.Width;
+            var bottom = top + rectangle.Height;
+            var pageStartStep = _scorePageIndex * StepsPerScoreSheet;
+            _selectedNotes.Clear();
+            foreach (var note in SelectedTrack.Notes)
+            {
+                if (note.StartStep < pageStartStep || note.StartStep >= pageStartStep + StepsPerScoreSheet)
+                {
+                    continue;
+                }
+
+                var pageLocalStep = note.StartStep - pageStartStep;
+                var systemIndex = pageLocalStep / (BarsPerScorePage * StepsPerBar);
+                var localStep = pageLocalStep % (BarsPerScorePage * StepsPerBar);
+                var noteX = ScorePageLeft + (localStep + Math.Min(note.LengthSteps, 2) / 2d) * ScorePageStepWidth;
+                var noteClef = UsesGrandStaff ? (note.Pitch >= 60 ? "Treble" : "Bass") : PrimaryClef;
+                var staffBottom = 145 + systemIndex * ScoreSystemHeight;
+                var noteBottom = UsesGrandStaff && noteClef == "Bass" ? staffBottom + GrandStaffGap : staffBottom;
+                var noteY = noteBottom - MidiToDiatonicStep(note.Pitch, noteClef) * 10;
+                if (noteX >= left && noteX <= right && noteY >= top && noteY <= bottom)
+                {
+                    _selectedNotes.Add(note);
+                }
+            }
+
+            _selectedNote = _selectedNotes.LastOrDefault();
+            OnPropertyChanged(nameof(HasSelectedNote));
+            ScoreCanvas.Focus();
+        }
+        else if (_pendingNoteEntry && !_scoreDragMoved && SelectedTrack is not null)
+        {
+            var totalSteps = AudioTrack.TimelineBarCount * StepsPerBar;
+            var note = new MusicalNote(_pendingNotePitch, _pendingNoteStartStep,
+                Math.Min(SelectedNoteLengthSteps, totalSteps - _pendingNoteStartStep), (int)Math.Round(NoteVelocitySlider.Value));
+            SelectedTrack.Notes.Add(note);
+            SelectedNote = note;
+        }
+
+        if (_noteSelectionRectangle is not null)
+        {
+            ScoreCanvas.Children.Remove(_noteSelectionRectangle);
+            _noteSelectionRectangle = null;
+        }
+
+        _isSelectingNotes = false;
+        _isMovingNotes = false;
+        _draggedNote = null;
+        _noteDragOrigins.Clear();
+        _pendingNoteEntry = false;
+        ScoreCanvas.ReleaseMouseCapture();
+        UpdateSelectedNoteControls();
+        RenderScore();
+        e.Handled = true;
+    }
+
+    private void ScorePageSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        if (_isUpdatingScorePageSlider)
+        {
+            return;
+        }
+
+        var pageIndex = Math.Clamp((int)Math.Round(e.NewValue), 0, ScorePageCount - 1);
+        if (pageIndex != _scorePageIndex)
+        {
+            _scorePageIndex = pageIndex;
+            RenderScore();
         }
     }
 
@@ -1145,7 +1449,76 @@ public partial class MainWindow : Window
         }
 
         var length = SelectedNoteLengthSteps;
-        SelectedNote.LengthSteps = Math.Min(length, AudioTrack.TimelineBarCount * StepsPerBar - SelectedNote.StartStep);
+        foreach (var note in GetSelectedNotes())
+        {
+            note.LengthSteps = Math.Min(length, AudioTrack.TimelineBarCount * StepsPerBar - note.StartStep);
+        }
+    }
+
+    private IEnumerable<MusicalNote> GetSelectedNotes() =>
+        SelectedTrack is null ? [] : _selectedNotes.Where(SelectedTrack.Notes.Contains).ToList();
+
+    private void AccidentalPicker_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_isUpdatingNoteControls || SelectedTrack is null || _selectedNotes.Count == 0)
+        {
+            return;
+        }
+
+        var accidental = SelectedAccidentalOffset;
+        foreach (var note in GetSelectedNotes())
+        {
+            var naturalPitch = note.Pitch - (note.Pitch % 12 is 1 or 3 or 6 or 8 or 10 ? 1 : 0);
+            note.Pitch = Math.Clamp(naturalPitch + accidental, PianoRollLowestPitch, PianoRollHighestPitch);
+        }
+    }
+
+    private void ArticulationPicker_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_isUpdatingNoteControls || SelectedTrack is null || _selectedNotes.Count == 0 || ArticulationPicker.SelectedItem is not ComboBoxItem { Tag: string articulation })
+        {
+            return;
+        }
+
+        foreach (var note in GetSelectedNotes())
+        {
+            note.Articulation = articulation;
+        }
+    }
+
+    private void SlurSelection_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_isUpdatingNoteControls || SelectedTrack is null)
+        {
+            return;
+        }
+
+        var selected = GetSelectedNotes().OrderBy(note => note.StartStep).ToList();
+        if (SlurSelectionToggle.IsChecked == true && selected.Count < 2)
+        {
+            _isUpdatingNoteControls = true;
+            SlurSelectionToggle.IsChecked = false;
+            _isUpdatingNoteControls = false;
+            AudioStatus = "연결할 음표를 두 개 이상 선택하세요";
+            return;
+        }
+
+        var selectedSet = selected.ToHashSet();
+        var orderedTrackNotes = SelectedTrack.Notes.OrderBy(note => note.StartStep).ToList();
+        foreach (var note in selected)
+        {
+            var noteIndex = orderedTrackNotes.IndexOf(note);
+            note.IsSlurredToNext = SlurSelectionToggle.IsChecked == true &&
+                noteIndex >= 0 && noteIndex + 1 < orderedTrackNotes.Count && selectedSet.Contains(orderedTrackNotes[noteIndex + 1]);
+        }
+
+        if (SlurSelectionToggle.IsChecked == true && selected.All(note => !note.IsSlurredToNext))
+        {
+            _isUpdatingNoteControls = true;
+            SlurSelectionToggle.IsChecked = false;
+            _isUpdatingNoteControls = false;
+            AudioStatus = "연음으로 연결할 음표를 시간 순서대로 함께 선택하세요";
+        }
     }
 
     private void NoteVelocitySlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
@@ -1168,8 +1541,26 @@ public partial class MainWindow : Window
             return;
         }
 
-        SelectedTrack.Notes.Remove(SelectedNote);
+        var notesToDelete = GetSelectedNotes().ToList();
+        if (notesToDelete.Count == 0)
+        {
+            notesToDelete.Add(SelectedNote);
+        }
+
+        foreach (var note in notesToDelete)
+        {
+            SelectedTrack.Notes.Remove(note);
+        }
         SelectedNote = null;
+    }
+
+    private void ScoreCanvas_KeyDown(object sender, KeyEventArgs e)
+    {
+        if ((e.Key is Key.Delete or Key.Back) && SelectedTrack is not null && HasSelectedNote)
+        {
+            DeleteSelectedNote_Click(sender, new RoutedEventArgs());
+            e.Handled = true;
+        }
     }
 
     private void DockPanelHeader_MouseDown(object sender, MouseButtonEventArgs e)
@@ -1223,7 +1614,44 @@ public partial class MainWindow : Window
 
         RemovePanelFromHost(sourceHost, panel);
         AddPanelToHost(targetHost, panelId, panel);
-        SaveDockLayout();
+        e.Effects = DragDropEffects.Move;
+        e.Handled = true;
+    }
+
+    private void ScoreEditor_PreviewDragOver(object sender, DragEventArgs e)
+    {
+        var panelId = e.Data.GetData("MakeMusic.DockPanel") as string;
+        var sourceHost = panelId is null ? null : FindDockHost(panelId);
+        e.Effects = panelId is not null && _dockPanels.ContainsKey(panelId) && sourceHost is not null
+            ? DragDropEffects.Move
+            : DragDropEffects.None;
+        e.Handled = true;
+    }
+
+    private void ScoreEditor_PreviewDrop(object sender, DragEventArgs e)
+    {
+        if (e.Data.GetData("MakeMusic.DockPanel") is not string panelId ||
+            !_dockPanels.TryGetValue(panelId, out var panel))
+        {
+            return;
+        }
+
+        var sourceHost = FindDockHost(panelId);
+        if (sourceHost is null)
+        {
+            return;
+        }
+
+        RemovePanelFromHost(sourceHost, panel);
+        var destination = ScoreEditorTabItem;
+        if (destination.Content is not ContentControl contentHost)
+        {
+            contentHost = new ContentControl { HorizontalContentAlignment = HorizontalAlignment.Stretch, VerticalContentAlignment = VerticalAlignment.Stretch };
+            destination.Content = contentHost;
+        }
+
+        AddPanelToHost(contentHost, panelId, panel);
+        ScoreEditorTabs.SelectedItem = destination;
         e.Effects = DragDropEffects.Move;
         e.Handled = true;
     }
@@ -1302,119 +1730,6 @@ public partial class MainWindow : Window
         _ => panelId
     };
 
-    private ContentControl? GetDockHost(string slotId) => slotId switch
-    {
-        "Project" => ProjectPanelHost,
-        "Instrument" => InstrumentPanelHost,
-        "Mixer" => MixerPanelHost,
-        "Results" => ResultsPanelHost,
-        _ => null
-    };
-
-    private static string DockLayoutFilePath => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "MakeMusic",
-        "workspace-layout.json");
-
-    private void RestoreDockLayout()
-    {
-        if (!File.Exists(DockLayoutFilePath))
-        {
-            return;
-        }
-
-        try
-        {
-            var layout = JsonSerializer.Deserialize<Dictionary<string, List<string>>>(File.ReadAllText(DockLayoutFilePath));
-            if (layout is null)
-            {
-                return;
-            }
-
-            foreach (var host in new[] { ProjectPanelHost, InstrumentPanelHost, MixerPanelHost, ResultsPanelHost })
-            {
-                host.Content = null;
-            }
-
-            var placedPanelIds = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var slotId in new[] { "Project", "Instrument", "Mixer", "Results" })
-            {
-                var host = GetDockHost(slotId);
-                if (host is null || !layout.TryGetValue(slotId, out var panelIds))
-                {
-                    continue;
-                }
-
-                foreach (var panelId in panelIds)
-                {
-                    if (_dockPanels.TryGetValue(panelId, out var panel) && placedPanelIds.Add(panelId))
-                    {
-                        AddPanelToHost(host, panelId, panel);
-                    }
-                }
-            }
-
-            foreach (var panelId in _dockPanels.Keys.Where(panelId => !placedPanelIds.Contains(panelId)))
-            {
-                var preferredHost = GetDockHost(panelId);
-                var targetHost = preferredHost?.Content is null
-                    ? preferredHost
-                    : new[] { ProjectPanelHost, InstrumentPanelHost, MixerPanelHost, ResultsPanelHost }.FirstOrDefault(host => host.Content is null);
-                if (targetHost is not null)
-                {
-                    AddPanelToHost(targetHost, panelId, _dockPanels[panelId]);
-                }
-            }
-        }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or ArgumentException)
-        {
-            // Keep the default workspace if a saved layout cannot be read.
-        }
-    }
-
-    private void SaveDockLayout()
-    {
-        var layout = new Dictionary<string, List<string>>(StringComparer.Ordinal);
-        foreach (var slotId in new[] { "Project", "Instrument", "Mixer", "Results" })
-        {
-            var host = GetDockHost(slotId);
-            if (host is not null)
-            {
-                layout[slotId] = GetDockPanelIds(host.Content);
-            }
-        }
-
-        try
-        {
-            var directory = Path.GetDirectoryName(DockLayoutFilePath)!;
-            Directory.CreateDirectory(directory);
-            File.WriteAllText(DockLayoutFilePath, JsonSerializer.Serialize(layout, JsonOptions));
-        }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-        {
-            AudioStatus = "패널 배치 저장 실패";
-        }
-    }
-
-    private List<string> GetDockPanelIds(object? hostContent)
-    {
-        if (hostContent is TabControl tabs)
-        {
-            return tabs.Items.OfType<TabItem>()
-                .Select(item => GetDockPanelId(item.Content))
-                .OfType<string>()
-                .ToList();
-        }
-
-        var panelId = hostContent is UIElement panel ? GetDockPanelId(panel) : null;
-        return panelId is null ? [] : [panelId];
-    }
-
-    private string? GetDockPanelId(object? panel) =>
-        panel is UIElement element
-            ? _dockPanels.FirstOrDefault(item => ReferenceEquals(item.Value, element)).Key
-            : null;
-
     private int SelectedNoteLengthSteps
     {
         get
@@ -1440,7 +1755,7 @@ public partial class MainWindow : Window
 
     private void UpdateSelectedNoteControls()
     {
-        if (NoteVelocityValue is null || NoteLengthPicker is null)
+            if (NoteVelocityValue is null || NoteLengthPicker is null || ArticulationPicker is null || SlurSelectionToggle is null)
         {
             return;
         }
@@ -1451,6 +1766,7 @@ public partial class MainWindow : Window
             if (SelectedNote is null)
             {
                 SelectedNoteSummary.Text = SelectedTrack is null ? "악기를 선택하세요" : "음표 선택 없음";
+            SlurSelectionToggle.IsChecked = GetSelectedNotes().Any(note => note.IsSlurredToNext);
                 return;
             }
 
@@ -1461,6 +1777,8 @@ public partial class MainWindow : Window
             {
                 NoteLengthPicker.SelectedIndex = selectedLengthIndex;
             }
+            ArticulationPicker.SelectedIndex = SelectedNote.Articulation switch { "Tenuto" => 1, "Staccato" => 2, _ => 0 };
+            SlurSelectionToggle.IsChecked = GetSelectedNotes().Any(note => note.IsSlurredToNext);
         }
         finally
         {
@@ -1475,46 +1793,54 @@ public partial class MainWindow : Window
             return;
         }
 
-        var totalSteps = AudioTrack.TimelineBarCount * StepsPerBar;
-        var gridWidth = totalSteps * PianoRollStepWidth;
-        const double scoreLeft = 52;
-        const double staffBottom = 220;
-        const double staffStepHeight = 12;
-        ScoreCanvas.Width = scoreLeft + gridWidth;
-        ScoreCanvas.Height = 320;
+        const double staffStepHeight = 10;
+        var visibleSteps = BarsPerScorePage * StepsPerBar;
+        var pageStartStep = _scorePageIndex * StepsPerScoreSheet;
+        var pageEndStep = Math.Min(AudioTrack.TimelineBarCount * StepsPerBar, pageStartStep + StepsPerScoreSheet);
+        var pageNumberStart = _scorePageIndex * BarsPerScoreSheet + 1;
+        ScoreCanvas.Width = ScorePageLeft + visibleSteps * ScorePageStepWidth + 12;
+        var visibleSystems = VisibleSystemsOnPage;
+        ScoreCanvas.Height = visibleSystems * ScoreSystemHeight + 24;
         ScoreCanvas.Children.Clear();
+        ScoreDockHost.Content = _scoreEditorContent;
+        var pageNumberEnd = Math.Min(AudioTrack.TimelineBarCount, pageNumberStart + BarsPerScoreSheet - 1);
+        ScorePageLabel.Text = $"마디 {pageNumberStart}–{pageNumberEnd} / {AudioTrack.TimelineBarCount}";
+        _isUpdatingScorePageSlider = true;
+        ScorePageSlider.Value = _scorePageIndex;
+        _isUpdatingScorePageSlider = false;
 
-        AddScoreLabel("높은음자리표", 4, 34, 10, Brushes.DimGray);
-        AddScoreLabel("마디", 28, 4, 9, Brushes.DimGray);
-        for (var lineIndex = 0; lineIndex < 5; lineIndex++)
+        for (var systemIndex = 0; systemIndex < visibleSystems; systemIndex++)
         {
-            AddScoreLine(scoreLeft, staffBottom - lineIndex * staffStepHeight * 2, gridWidth, 1,
-                Color.FromRgb(95, 103, 96));
-        }
-
-        for (var step = 0; step <= totalSteps; step++)
-        {
-            var isBar = step % StepsPerBar == 0;
-            var isBeat = step % StepsPerBeat == 0;
-            AddScoreLine(scoreLeft + step * PianoRollStepWidth, 24, isBar ? 2 : 1, 224,
-                isBar ? Color.FromRgb(165, 174, 166) : isBeat ? Color.FromRgb(224, 228, 223) : Color.FromRgb(241, 243, 240));
-
-            if (isBar && step < totalSteps)
+            var systemY = systemIndex * ScoreSystemHeight;
+            var staffBottom = 145 + systemY;
+            var lowerStaffBottom = staffBottom + GrandStaffGap;
+            var firstBar = pageNumberStart + systemIndex * BarsPerScorePage;
+            DrawStaff(staffBottom, PrimaryClef, firstBar, BarsPerScorePage, visibleSteps);
+            if (UsesGrandStaff)
             {
-                AddScoreLabel((step / StepsPerBar + 1).ToString(), scoreLeft + step * PianoRollStepWidth + 3, 4, 9, Brushes.DimGray);
+                DrawStaff(lowerStaffBottom, "Bass", firstBar, BarsPerScorePage, visibleSteps);
+                AddScoreLine(ScorePageLeft - 2, staffBottom - 80, 2, lowerStaffBottom - staffBottom + 80, Color.FromRgb(110, 118, 111));
+                AddScoreLine(ScorePageLeft + visibleSteps * ScorePageStepWidth, staffBottom - 80, 2, lowerStaffBottom - staffBottom + 80, Color.FromRgb(110, 118, 111));
+                for (var bar = 0; bar <= BarsPerScorePage; bar++)
+                {
+                    var barX = ScorePageLeft + bar * StepsPerBar * ScorePageStepWidth;
+                    AddScoreLine(barX, staffBottom - 80, bar == BarsPerScorePage ? 2 : 1, lowerStaffBottom - staffBottom + 80, Color.FromRgb(165, 174, 166));
+                }
             }
         }
+        AddScoreLabel("♩ =", 5, 8, 9, Brushes.DimGray);
+        AddScoreLabel(TempoBpm.ToString(), 31, 8, 9, Brushes.DimGray);
 
         _scorePlayheadIndicator = new Border
         {
             Width = 2,
-            Height = 120,
+            Height = UsesGrandStaff ? GrandStaffGap + 80 : 80,
             Background = Brushes.IndianRed,
             IsHitTestVisible = false,
             Visibility = Visibility.Collapsed
         };
-        Canvas.SetLeft(_scorePlayheadIndicator, scoreLeft);
-        Canvas.SetTop(_scorePlayheadIndicator, 112);
+        Canvas.SetLeft(_scorePlayheadIndicator, ScorePageLeft);
+        Canvas.SetTop(_scorePlayheadIndicator, 65);
         ScoreCanvas.Children.Add(_scorePlayheadIndicator);
 
         if (SelectedTrack is null)
@@ -1522,49 +1848,171 @@ public partial class MainWindow : Window
             return;
         }
 
+        var notePositions = new Dictionary<MusicalNote, (double X, double Y, int System)>();
         foreach (var note in SelectedTrack.Notes)
         {
-            var notePosition = MidiToDiatonicStep(note.Pitch);
-            var x = scoreLeft + note.StartStep * PianoRollStepWidth + PianoRollStepWidth / 2;
-            var y = staffBottom - notePosition * staffStepHeight;
-            var selected = ReferenceEquals(note, SelectedNote);
-            if (notePosition < 0 || notePosition > 8)
+            if (note.StartStep < pageStartStep || note.StartStep >= pageEndStep)
             {
-                var ledger = new Border { Width = 18, Height = 1, Background = Brushes.Black, IsHitTestVisible = false };
-                Canvas.SetLeft(ledger, x - 9);
-                Canvas.SetTop(ledger, staffBottom - (notePosition < 0 ? -2 : 10) * staffStepHeight);
-                ScoreCanvas.Children.Add(ledger);
+                continue;
             }
+
+            var noteClef = UsesGrandStaff ? (note.Pitch >= 60 ? "Treble" : "Bass") : PrimaryClef;
+            var pageLocalStep = note.StartStep - pageStartStep;
+            var systemIndex = pageLocalStep / visibleSteps;
+            var localStart = pageLocalStep % visibleSteps;
+            var systemY = systemIndex * ScoreSystemHeight;
+            var staffBottom = 145 + systemY;
+            var lowerStaffBottom = staffBottom + GrandStaffGap;
+            var noteBottom = UsesGrandStaff && noteClef == "Bass" ? lowerStaffBottom : staffBottom;
+            var notePosition = MidiToDiatonicStep(note.Pitch, noteClef);
+            var x = ScorePageLeft + (localStart + Math.Min(note.LengthSteps, 2) / 2d) * ScorePageStepWidth;
+            var y = noteBottom - notePosition * staffStepHeight;
+            notePositions[note] = (x, y, systemIndex);
+            var selected = _selectedNotes.Contains(note);
+            if (notePosition < -4 || notePosition > 8)
+            {
+                for (var ledgerStep = notePosition < 0 ? -2 : 10;
+                     notePosition < 0 ? ledgerStep >= notePosition : ledgerStep <= notePosition;
+                     ledgerStep += notePosition < 0 ? -2 : 2)
+                {
+                    var ledger = new Border { Width = 22, Height = 1, Background = Brushes.Black, IsHitTestVisible = false };
+                    Canvas.SetLeft(ledger, x - 11);
+                    Canvas.SetTop(ledger, noteBottom - ledgerStep * staffStepHeight);
+                    ScoreCanvas.Children.Add(ledger);
+                }
+            }
+            var noteheadFill = note.LengthSteps >= 16 ? Brushes.White : note.LengthSteps >= 8 ? Brushes.White : selected ? Brushes.SeaGreen : Brushes.Black;
             var notehead = new Ellipse
             {
-                Width = 12,
-                Height = 8,
-                Fill = note.LengthSteps >= 8 ? Brushes.White : selected ? Brushes.SeaGreen : Brushes.Black,
+                Width = 15,
+                Height = 10,
+                Fill = noteheadFill,
                 Stroke = selected ? Brushes.SeaGreen : Brushes.Black,
                 StrokeThickness = 1.5,
                 RenderTransform = new RotateTransform(-20),
                 RenderTransformOrigin = new Point(0.5, 0.5),
                 DataContext = note,
                 Cursor = Cursors.Hand,
-                ToolTip = $"{GetPitchName(note.Pitch)} · {note.LengthSteps}/16 박 · 세기 {note.Velocity}"
+                ToolTip = $"{GetPitchName(note.Pitch)} · {GetNoteValueName(note.LengthSteps)} · 세기 {note.Velocity}"
             };
             notehead.MouseLeftButtonDown += PianoRollNote_MouseLeftButtonDown;
-            Canvas.SetLeft(notehead, x - 6);
-            Canvas.SetTop(notehead, y - 4);
+            notehead.MouseRightButtonDown += PianoRollNote_MouseRightButtonDown;
+            Canvas.SetLeft(notehead, x - 7.5);
+            Canvas.SetTop(notehead, y - 5);
             ScoreCanvas.Children.Add(notehead);
 
-            var noteClass = note.Pitch % 12;
-            if (noteClass is 1 or 3 or 6 or 8 or 10)
+            var pitchClass = note.Pitch % 12;
+            if (pitchClass is 1 or 3 or 6 or 8 or 10)
             {
-                AddScoreLabel("♯", x - 17, y - 10, 12, Brushes.Black);
+                var preferFlat = AccidentalPicker?.SelectedItem is ComboBoxItem { Tag: "-1" };
+                var accidental = preferFlat ? "♭" : "♯";
+                AddScoreLabel(accidental, x - 19, y - 10, 12, Brushes.Black);
+            }
+
+            if (note.Articulation == "Staccato")
+            {
+                var dot = new Ellipse { Width = 4, Height = 4, Fill = Brushes.Black, IsHitTestVisible = false };
+                Canvas.SetLeft(dot, x + 10);
+                Canvas.SetTop(dot, y + 1);
+                ScoreCanvas.Children.Add(dot);
+            }
+            else if (note.Articulation == "Tenuto")
+            {
+                var tenutoMark = new Border
+                {
+                    Width = 11,
+                    Height = 1.5,
+                    Background = selected ? Brushes.SeaGreen : Brushes.Black,
+                    IsHitTestVisible = false
+                };
+                Canvas.SetLeft(tenutoMark, x - 5.5);
+                Canvas.SetTop(tenutoMark, y + 9);
+                ScoreCanvas.Children.Add(tenutoMark);
             }
 
             if (note.LengthSteps < 16)
             {
-                var stem = new Border { Width = 1, Height = 34, Background = selected ? Brushes.SeaGreen : Brushes.Black, IsHitTestVisible = false };
-                Canvas.SetLeft(stem, x + 5);
-                Canvas.SetTop(stem, y - 32);
+                var stemHeight = 36d;
+                var stemX = x + 6;
+                var stemTop = y - stemHeight;
+                var stem = new Border { Width = 1.4, Height = stemHeight, Background = selected ? Brushes.SeaGreen : Brushes.Black, IsHitTestVisible = false };
+                Canvas.SetLeft(stem, stemX);
+                Canvas.SetTop(stem, stemTop);
                 ScoreCanvas.Children.Add(stem);
+
+                var flagCount = note.LengthSteps <= 2 ? 2 : note.LengthSteps <= 4 ? 1 : 0;
+                for (var flagIndex = 0; flagIndex < flagCount; flagIndex++)
+                {
+                    var flag = new System.Windows.Shapes.Path
+                    {
+                        Data = Geometry.Parse("M 0,0 C 13,5 13,13 2,18"),
+                        Stroke = selected ? Brushes.SeaGreen : Brushes.Black,
+                        StrokeThickness = 2,
+                        IsHitTestVisible = false,
+                        RenderTransform = new TranslateTransform(stemX, stemTop + flagIndex * 7)
+                    };
+                    ScoreCanvas.Children.Add(flag);
+                }
+            }
+        }
+
+        var orderedScoreNotes = SelectedTrack.Notes.OrderBy(note => note.StartStep).ToList();
+        foreach (var note in orderedScoreNotes.Where(note => note.IsSlurredToNext && notePositions.ContainsKey(note)))
+        {
+            var noteIndex = orderedScoreNotes.IndexOf(note);
+            var nextNote = noteIndex >= 0 && noteIndex + 1 < orderedScoreNotes.Count ? orderedScoreNotes[noteIndex + 1] : null;
+            if (nextNote is null || !notePositions.TryGetValue(nextNote, out var nextPosition))
+            {
+                continue;
+            }
+
+            var startPosition = notePositions[note];
+            if (nextPosition.X - startPosition.X < 16)
+            {
+                continue;
+            }
+
+            var goesToNextSystem = startPosition.System != nextPosition.System;
+            var start = new Point(startPosition.X + 5, startPosition.Y - 4);
+            var end = goesToNextSystem
+                ? new Point(ScorePageLeft - 6, nextPosition.Y - 4)
+                : new Point(nextPosition.X - 5, nextPosition.Y - 4);
+            var archY = Math.Min(start.Y, end.Y) - 22;
+            var curve = new System.Windows.Media.PathGeometry();
+            var figure = new System.Windows.Media.PathFigure { StartPoint = start, IsClosed = false };
+            figure.Segments.Add(new System.Windows.Media.BezierSegment(
+                new Point(start.X + (end.X - start.X) / 3, archY),
+                new Point(start.X + (end.X - start.X) * 2 / 3, archY),
+                end,
+                true));
+            curve.Figures.Add(figure);
+            ScoreCanvas.Children.Add(new System.Windows.Shapes.Path
+            {
+                Data = curve,
+                Stroke = Brushes.Black,
+                StrokeThickness = 1.5,
+                IsHitTestVisible = false
+            });
+
+            if (goesToNextSystem)
+            {
+                var continuationStart = new Point(ScorePageLeft - 2, nextPosition.Y - 4);
+                var continuationEnd = new Point(nextPosition.X - 5, nextPosition.Y - 4);
+                var continuationCurve = new System.Windows.Media.PathGeometry();
+                var continuationFigure = new System.Windows.Media.PathFigure { StartPoint = continuationStart, IsClosed = false };
+                continuationFigure.Segments.Add(new System.Windows.Media.BezierSegment(
+                    new Point(continuationStart.X + (continuationEnd.X - continuationStart.X) / 3, continuationStart.Y - 22),
+                    new Point(continuationStart.X + (continuationEnd.X - continuationStart.X) * 2 / 3, continuationStart.Y - 22),
+                    continuationEnd,
+                    true));
+                continuationCurve.Figures.Add(continuationFigure);
+                ScoreCanvas.Children.Add(new System.Windows.Shapes.Path
+                {
+                    Data = continuationCurve,
+                    Stroke = Brushes.Black,
+                    StrokeThickness = 1.5,
+                    IsHitTestVisible = false
+                });
             }
         }
 
@@ -1573,6 +2021,54 @@ public partial class MainWindow : Window
             UpdateScorePlayhead(isVisible: true);
         }
     }
+
+    private void PianoRollNote_MouseRightButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (SelectedTrack is not null && sender is FrameworkElement { DataContext: MusicalNote note })
+        {
+            SelectedTrack.Notes.Remove(note);
+            _selectedNotes.Remove(note);
+            if (ReferenceEquals(SelectedNote, note))
+            {
+                _selectedNote = _selectedNotes.LastOrDefault();
+                OnPropertyChanged(nameof(SelectedNote));
+                OnPropertyChanged(nameof(HasSelectedNote));
+                UpdateSelectedNoteControls();
+            }
+            RenderScore();
+            e.Handled = true;
+        }
+    }
+
+    private void DrawStaff(double staffBottom, string clef, int pageNumberStart, int barsPerPage, int visibleSteps)
+    {
+        const double staffStepHeight = 10;
+        var staffTop = staffBottom - 8 * staffStepHeight;
+        AddScoreLabel(clef == "Bass" ? "𝄢" : "𝄞", 8, staffBottom - 91, 58, Brushes.Black, "Segoe UI Symbol");
+        AddScoreLabel("4", 31, staffTop + 7, 18, Brushes.Black);
+        AddScoreLabel("4", 31, staffTop + 26, 18, Brushes.Black);
+        for (var lineIndex = 0; lineIndex < 5; lineIndex++)
+        {
+            AddScoreLine(ScorePageLeft, staffBottom - lineIndex * staffStepHeight * 2, visibleSteps * ScorePageStepWidth, 1, Color.FromRgb(95, 103, 96));
+        }
+
+        for (var measure = 0; measure <= barsPerPage; measure++)
+        {
+            var x = ScorePageLeft + measure * StepsPerBar * ScorePageStepWidth;
+            AddScoreLine(x, staffTop, measure == barsPerPage ? 2 : 1, staffBottom - staffTop, Color.FromRgb(165, 174, 166));
+            if (measure < barsPerPage)
+            {
+                AddScoreLabel((pageNumberStart + measure).ToString(), x + 4, staffTop - 18, 9, Brushes.DimGray);
+                for (var beat = 1; beat < 4; beat++)
+                {
+                    var beatX = x + beat * StepsPerBeat * ScorePageStepWidth;
+                    AddScoreLine(beatX, staffTop, 1, staffBottom - staffTop, Color.FromRgb(230, 233, 230));
+                }
+            }
+        }
+    }
+
+    private string GetNoteClef(int pitch) => UsesGrandStaff ? (pitch >= 60 ? "Treble" : "Bass") : PrimaryClef;
 
     private void UpdateScorePlayhead(bool isVisible)
     {
@@ -1587,13 +2083,42 @@ public partial class MainWindow : Window
             return;
         }
 
-        const double scoreLeft = 52;
+        var visibleSteps = BarsPerScorePage * StepsPerBar;
         var elapsedSteps = _playbackStopwatch.Elapsed.TotalSeconds / (60d / TempoBpm / StepsPerBeat);
-        Canvas.SetLeft(_scorePlayheadIndicator, scoreLeft + elapsedSteps * PianoRollStepWidth);
-        _scorePlayheadIndicator.Visibility = elapsedSteps <= AudioTrack.TimelineBarCount * StepsPerBar
+        var currentPage = (int)(elapsedSteps / StepsPerScoreSheet);
+        if (currentPage != _scorePageIndex && currentPage >= 0 && currentPage < ScorePageCount)
+        {
+            _scorePageIndex = currentPage;
+            RenderScore();
+            return;
+        }
+
+        if (elapsedSteps >= AudioTrack.TimelineBarCount * StepsPerBar)
+        {
+            _scorePlayheadIndicator.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        var pageLocalStep = elapsedSteps - _scorePageIndex * StepsPerScoreSheet;
+        var systemIndex = (int)(pageLocalStep / visibleSteps);
+        var localStep = pageLocalStep % visibleSteps;
+        Canvas.SetLeft(_scorePlayheadIndicator, ScorePageLeft + localStep * ScorePageStepWidth);
+        Canvas.SetTop(_scorePlayheadIndicator, systemIndex * ScoreSystemHeight + 65);
+        _scorePlayheadIndicator.Visibility = pageLocalStep <= StepsPerScoreSheet
             ? Visibility.Visible
             : Visibility.Collapsed;
     }
+
+    private static string GetNoteValueName(int lengthSteps) => lengthSteps switch
+    {
+        >= 64 => "4마디 장음",
+        >= 32 => "2마디 장음",
+        >= 16 => "온음표",
+        >= 8 => "2분음표",
+        >= 4 => "4분음표",
+        >= 2 => "8분음표",
+        _ => "16분음표"
+    };
 
     private void AddScoreLine(double left, double top, double width, double height, Color color)
     {
@@ -1603,15 +2128,22 @@ public partial class MainWindow : Window
         ScoreCanvas.Children.Add(line);
     }
 
-    private void AddScoreLabel(string text, double left, double top, double fontSize, Brush foreground)
+    private void AddScoreLabel(string text, double left, double top, double fontSize, Brush foreground, string? fontFamily = null)
     {
-        var label = new TextBlock { Text = text, FontSize = fontSize, Foreground = foreground, IsHitTestVisible = false };
+        var label = new TextBlock
+        {
+            Text = text,
+            FontSize = fontSize,
+            Foreground = foreground,
+            FontFamily = fontFamily is null ? SystemFonts.MessageFontFamily : new System.Windows.Media.FontFamily(fontFamily),
+            IsHitTestVisible = false
+        };
         Canvas.SetLeft(label, left);
         Canvas.SetTop(label, top);
         ScoreCanvas.Children.Add(label);
     }
 
-    private static int MidiToDiatonicStep(int midiPitch)
+    private static int MidiToDiatonicStep(int midiPitch, string clef)
     {
         var pitchClass = midiPitch % 12;
         var octave = midiPitch / 12 - 1;
@@ -1630,15 +2162,18 @@ public partial class MainWindow : Window
             letter = pitchClass switch { 1 => 0, 3 => 1, 6 => 3, 8 => 4, _ => 5 };
         }
         var diatonicIndex = octave * 7 + letter;
-        var e4Index = 4 * 7 + 2;
-        return diatonicIndex - e4Index;
+        var referenceIndex = clef == "Bass" ? 2 * 7 + 4 : 4 * 7 + 2;
+        return diatonicIndex - referenceIndex;
     }
 
-    private static int DiatonicStepToMidi(int step)
+    private static int DiatonicStepToMidi(int step, string clef)
     {
-        var naturalPitches = new[] { 60, 62, 64, 65, 67, 69, 71, 72, 74, 76, 77, 79, 81, 83 };
-        var index = step + 2; // C4 is two diatonic steps below E4.
-        return index >= 0 && index < naturalPitches.Length ? naturalPitches[index] : -1;
+        var referenceDiatonic = clef == "Bass" ? 2 * 7 + 4 : 4 * 7 + 2;
+        var targetDiatonic = referenceDiatonic + step;
+        var octave = targetDiatonic / 7;
+        var letter = targetDiatonic % 7;
+        var naturalPitch = (octave + 1) * 12 + new[] { 0, 2, 4, 5, 7, 9, 11 }[letter];
+        return naturalPitch;
     }
 
     private static bool IsBlackKey(int pitch) => pitch % 12 is 1 or 3 or 6 or 8 or 10;

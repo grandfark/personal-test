@@ -33,6 +33,8 @@ public sealed class MusicalNoteDocument
     public int StartStep { get; set; }
     public int LengthSteps { get; set; } = 4;
     public int Velocity { get; set; } = 100;
+    public string Articulation { get; set; } = "Normal";
+    public bool IsSlurredToNext { get; set; }
 }
 
 public sealed class AudioTrackDocument
