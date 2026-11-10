@@ -29,12 +29,17 @@ public sealed class InstrumentTrackDocument
 
 public sealed class MusicalNoteDocument
 {
+    public Guid Id { get; set; }
     public int Pitch { get; set; } = 60;
     public int StartStep { get; set; }
     public int LengthSteps { get; set; } = 4;
     public int Velocity { get; set; } = 100;
     public string Articulation { get; set; } = "Normal";
+    public string StemDirection { get; set; } = "Up";
     public bool IsSlurredToNext { get; set; }
+    public Guid? SlurredToNoteId { get; set; }
+    public bool IsTiedToNext { get; set; }
+    public Guid? TiedToNoteId { get; set; }
 }
 
 public sealed class AudioTrackDocument

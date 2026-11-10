@@ -602,7 +602,12 @@ public partial class MainWindow : Window
                         LengthSteps = note.LengthSteps,
                         Velocity = note.Velocity,
                         Articulation = note.Articulation,
-                        IsSlurredToNext = note.IsSlurredToNext
+                        StemDirection = note.StemDirection,
+                        IsSlurredToNext = note.IsSlurredToNext,
+                        Id = note.Id,
+                        SlurredToNoteId = note.SlurredToNoteId,
+                        IsTiedToNext = note.IsTiedToNext,
+                        TiedToNoteId = note.TiedToNoteId
                     }).ToList()
                 }).ToList(),
                 AudioTracks = AudioTracks.Select(track => new AudioTrackDocument
@@ -659,8 +664,13 @@ public partial class MainWindow : Window
                 {
                     instrumentTrack.Notes.Add(new MusicalNote(noteDocument.Pitch, noteDocument.StartStep, noteDocument.LengthSteps, noteDocument.Velocity)
                     {
+                        Id = noteDocument.Id == Guid.Empty ? Guid.NewGuid() : noteDocument.Id,
                         Articulation = noteDocument.Articulation,
-                        IsSlurredToNext = noteDocument.IsSlurredToNext
+                        StemDirection = noteDocument.StemDirection,
+                        IsSlurredToNext = noteDocument.IsSlurredToNext,
+                        SlurredToNoteId = noteDocument.SlurredToNoteId,
+                        IsTiedToNext = noteDocument.IsTiedToNext,
+                        TiedToNoteId = noteDocument.TiedToNoteId
                     });
                 }
 
@@ -687,6 +697,7 @@ public partial class MainWindow : Window
 
             SelectedTrack = InstrumentTracks.FirstOrDefault();
             SelectedAudioTrack = AudioTracks.FirstOrDefault();
+            RemoveInvalidTieLinks();
                 UpdateSelectedNoteControls();
         }
         finally
@@ -966,26 +977,21 @@ public partial class MainWindow : Window
                 }
 
                 var orderedNotes = track.Notes.OrderBy(note => note.StartStep).ToList();
+                var tiedNotes = new HashSet<MusicalNote>();
                 for (var noteIndex = 0; noteIndex < orderedNotes.Count; noteIndex++)
                 {
                     var note = orderedNotes[noteIndex];
-                    var articulationScale = note.Articulation == "Staccato" ? 0.4 : note.Articulation == "Tenuto" ? 2d : 1d;
-                    var sustainedSteps = note.LengthSteps;
-                    var lastTiedIndex = noteIndex;
-                    while (orderedNotes[lastTiedIndex].IsSlurredToNext && lastTiedIndex + 1 < orderedNotes.Count)
+                    if (tiedNotes.Contains(note))
                     {
-                        var nextNote = orderedNotes[lastTiedIndex + 1];
-                        if (nextNote.Pitch != note.Pitch || nextNote.StartStep != note.StartStep + sustainedSteps)
-                        {
-                            break;
-                        }
-
-                        sustainedSteps += nextNote.LengthSteps;
-                        lastTiedIndex++;
+                        continue;
                     }
 
-                    var overlapSeconds = lastTiedIndex == noteIndex && note.IsSlurredToNext ? 0.035 : 0;
-                    var duration = TimeSpan.FromSeconds(sustainedSteps * secondsPerStep * articulationScale + overlapSeconds);
+                    var articulationScale = note.Articulation == "Staccato" ? 0.4 : note.Articulation == "Tenuto" ? 2d : 1d;
+                    var tie = GetTiedDuration(track, note);
+                    tiedNotes.UnionWith(tie.Continuations);
+
+                    var overlapSeconds = tie.LastNote.IsSlurredToNext && GetSlurTarget(track, tie.LastNote) is not null ? 0.035 : 0;
+                    var duration = TimeSpan.FromSeconds(tie.Steps * secondsPerStep * articulationScale + overlapSeconds);
                     var delay = TimeSpan.FromSeconds(note.StartStep * secondsPerStep);
                     var semitonesFromA4 = note.Pitch - 69 + MasterFineTuneCents / 100d;
                     var frequency = MasterReferencePitch * Math.Pow(2, semitonesFromA4 / 12d);
@@ -996,7 +1002,6 @@ public partial class MainWindow : Window
                         duration);
                     mixer.AddMixerInput(new OffsetSampleProvider(tone) { DelayBy = delay });
                     scheduledTrackCount++;
-                    noteIndex = lastTiedIndex;
                 }
             }
 
@@ -1279,7 +1284,7 @@ public partial class MainWindow : Window
 
             if (e.ChangedButton == MouseButton.Right)
             {
-                SelectedTrack.Notes.Remove(note);
+                RemoveScoreNote(note);
                 if (ReferenceEquals(SelectedNote, note))
                 {
                     SelectedNote = null;
@@ -1396,7 +1401,7 @@ public partial class MainWindow : Window
                 }
             }
 
-            _selectedNote = _selectedNotes.LastOrDefault();
+            _selectedNote = _selectedNotes.OrderBy(note => note.StartStep).ThenBy(note => note.Pitch).LastOrDefault();
             OnPropertyChanged(nameof(HasSelectedNote));
             ScoreCanvas.Focus();
         }
@@ -1421,6 +1426,7 @@ public partial class MainWindow : Window
         _noteDragOrigins.Clear();
         _pendingNoteEntry = false;
         ScoreCanvas.ReleaseMouseCapture();
+        RemoveInvalidTieLinks();
         UpdateSelectedNoteControls();
         RenderScore();
         e.Handled = true;
@@ -1453,6 +1459,8 @@ public partial class MainWindow : Window
         {
             note.LengthSteps = Math.Min(length, AudioTrack.TimelineBarCount * StepsPerBar - note.StartStep);
         }
+
+        RemoveInvalidTieLinks();
     }
 
     private IEnumerable<MusicalNote> GetSelectedNotes() =>
@@ -1471,6 +1479,8 @@ public partial class MainWindow : Window
             var naturalPitch = note.Pitch - (note.Pitch % 12 is 1 or 3 or 6 or 8 or 10 ? 1 : 0);
             note.Pitch = Math.Clamp(naturalPitch + accidental, PianoRollLowestPitch, PianoRollHighestPitch);
         }
+
+        RemoveInvalidTieLinks();
     }
 
     private void ArticulationPicker_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -1486,6 +1496,19 @@ public partial class MainWindow : Window
         }
     }
 
+    private void StemDirectionPicker_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_isUpdatingNoteControls || SelectedTrack is null || StemDirectionPicker.SelectedItem is not ComboBoxItem { Tag: string direction })
+        {
+            return;
+        }
+
+        foreach (var note in GetSelectedNotes())
+        {
+            note.StemDirection = direction;
+        }
+    }
+
     private void SlurSelection_Changed(object sender, RoutedEventArgs e)
     {
         if (_isUpdatingNoteControls || SelectedTrack is null)
@@ -1493,7 +1516,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        var selected = GetSelectedNotes().OrderBy(note => note.StartStep).ToList();
+        var selected = GetSelectedNotes().OrderBy(note => note.StartStep).ThenBy(note => note.Pitch).ToList();
         if (SlurSelectionToggle.IsChecked == true && selected.Count < 2)
         {
             _isUpdatingNoteControls = true;
@@ -1503,22 +1526,65 @@ public partial class MainWindow : Window
             return;
         }
 
-        var selectedSet = selected.ToHashSet();
-        var orderedTrackNotes = SelectedTrack.Notes.OrderBy(note => note.StartStep).ToList();
-        foreach (var note in selected)
+        var shouldLink = SlurSelectionToggle.IsChecked == true;
+        for (var index = 0; index < selected.Count; index++)
         {
-            var noteIndex = orderedTrackNotes.IndexOf(note);
-            note.IsSlurredToNext = SlurSelectionToggle.IsChecked == true &&
-                noteIndex >= 0 && noteIndex + 1 < orderedTrackNotes.Count && selectedSet.Contains(orderedTrackNotes[noteIndex + 1]);
+            var note = selected[index];
+            var nextSelectedNote = selected.Skip(index + 1).FirstOrDefault(candidate => candidate.StartStep > note.StartStep);
+            note.SlurredToNoteId = shouldLink ? nextSelectedNote?.Id : null;
+            note.IsSlurredToNext = shouldLink && nextSelectedNote is not null;
         }
 
-        if (SlurSelectionToggle.IsChecked == true && selected.All(note => !note.IsSlurredToNext))
+        if (shouldLink && selected.All(note => !note.IsSlurredToNext))
         {
             _isUpdatingNoteControls = true;
             SlurSelectionToggle.IsChecked = false;
             _isUpdatingNoteControls = false;
             AudioStatus = "연음으로 연결할 음표를 시간 순서대로 함께 선택하세요";
         }
+    }
+
+    private void TieSelection_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_isUpdatingNoteControls || SelectedTrack is null)
+        {
+            return;
+        }
+
+        var selected = GetSelectedNotes().OrderBy(note => note.StartStep).ThenBy(note => note.Pitch).ToList();
+        var shouldTie = TieSelectionToggle.IsChecked == true;
+        if (shouldTie && selected.Count < 2)
+        {
+            SetTieToggle(false);
+            AudioStatus = "붙임줄로 연결할 음표를 두 개 이상 선택하세요";
+            return;
+        }
+
+        var tiePairs = selected
+            .Select((note, index) => (note, next: selected.Skip(index + 1).FirstOrDefault(candidate => candidate.StartStep > note.StartStep)))
+            .Where(entry => entry.next is not null)
+            .ToList();
+
+        if (shouldTie && (tiePairs.Count == 0 || tiePairs.Any(entry => entry.note.Pitch != entry.next!.Pitch ||
+            entry.next.StartStep != entry.note.StartStep + entry.note.LengthSteps)))
+        {
+            SetTieToggle(false);
+            AudioStatus = "붙임줄은 같은 높이에서 음 길이가 맞닿는 음표끼리만 연결할 수 있습니다";
+            return;
+        }
+
+        foreach (var entry in selected.Select((note, index) => (note, next: selected.Skip(index + 1).FirstOrDefault(candidate => candidate.StartStep > note.StartStep))))
+        {
+            entry.note.TiedToNoteId = shouldTie ? entry.next?.Id : null;
+            entry.note.IsTiedToNext = shouldTie && entry.next is not null;
+        }
+    }
+
+    private void SetTieToggle(bool isChecked)
+    {
+        _isUpdatingNoteControls = true;
+        TieSelectionToggle.IsChecked = isChecked;
+        _isUpdatingNoteControls = false;
     }
 
     private void NoteVelocitySlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
@@ -1549,9 +1615,35 @@ public partial class MainWindow : Window
 
         foreach (var note in notesToDelete)
         {
-            SelectedTrack.Notes.Remove(note);
+            RemoveScoreNote(note);
         }
         SelectedNote = null;
+    }
+
+    private void RemoveScoreNote(MusicalNote note)
+    {
+        if (SelectedTrack is null)
+        {
+            return;
+        }
+
+        foreach (var linkedNote in SelectedTrack.Notes.Where(candidate =>
+            candidate.SlurredToNoteId == note.Id || candidate.TiedToNoteId == note.Id).ToList())
+        {
+            if (linkedNote.SlurredToNoteId == note.Id)
+            {
+                linkedNote.SlurredToNoteId = null;
+                linkedNote.IsSlurredToNext = false;
+            }
+
+            if (linkedNote.TiedToNoteId == note.Id)
+            {
+                linkedNote.TiedToNoteId = null;
+                linkedNote.IsTiedToNext = false;
+            }
+        }
+
+        SelectedTrack.Notes.Remove(note);
     }
 
     private void ScoreCanvas_KeyDown(object sender, KeyEventArgs e)
@@ -1755,7 +1847,7 @@ public partial class MainWindow : Window
 
     private void UpdateSelectedNoteControls()
     {
-            if (NoteVelocityValue is null || NoteLengthPicker is null || ArticulationPicker is null || SlurSelectionToggle is null)
+            if (NoteVelocityValue is null || NoteLengthPicker is null || ArticulationPicker is null || StemDirectionPicker is null || SlurSelectionToggle is null || TieSelectionToggle is null)
         {
             return;
         }
@@ -1766,23 +1858,152 @@ public partial class MainWindow : Window
             if (SelectedNote is null)
             {
                 SelectedNoteSummary.Text = SelectedTrack is null ? "악기를 선택하세요" : "음표 선택 없음";
-            SlurSelectionToggle.IsChecked = GetSelectedNotes().Any(note => note.IsSlurredToNext);
+                SlurSelectionToggle.IsChecked = AreSelectedNotesSlurred();
+                TieSelectionToggle.IsChecked = AreSelectedNotesTied();
                 return;
             }
 
-            SelectedNoteSummary.Text = $"{GetPitchName(SelectedNote.Pitch)} · {SelectedNote.StartStep + 1}단계";
+            var selectedNotes = GetSelectedNotes().ToList();
+            SelectedNoteSummary.Text = selectedNotes.Count > 1
+                ? $"{selectedNotes.Count}개 음표 선택"
+                : $"{GetPitchName(SelectedNote.Pitch)} · {SelectedNote.StartStep + 1}단계";
             NoteVelocitySlider.Value = SelectedNote.Velocity;
+            if (IsBlackKey(SelectedNote.Pitch))
+            {
+                var keepFlatSpelling = AccidentalPicker.SelectedItem is ComboBoxItem { Tag: "-1" };
+                AccidentalPicker.SelectedIndex = keepFlatSpelling ? 2 : 1;
+            }
+            else
+            {
+                AccidentalPicker.SelectedIndex = 0;
+            }
+
             var selectedLengthIndex = Array.IndexOf(NoteLengthOptions, SelectedNote.LengthSteps);
             if (selectedLengthIndex >= 0)
             {
                 NoteLengthPicker.SelectedIndex = selectedLengthIndex;
             }
             ArticulationPicker.SelectedIndex = SelectedNote.Articulation switch { "Tenuto" => 1, "Staccato" => 2, _ => 0 };
-            SlurSelectionToggle.IsChecked = GetSelectedNotes().Any(note => note.IsSlurredToNext);
+            StemDirectionPicker.SelectedIndex = SelectedNote.StemDirection == "Down" ? 1 : 0;
+            SlurSelectionToggle.IsChecked = AreSelectedNotesSlurred();
+            TieSelectionToggle.IsChecked = AreSelectedNotesTied();
         }
         finally
         {
             _isUpdatingNoteControls = false;
+        }
+    }
+
+    private bool AreSelectedNotesSlurred()
+    {
+        if (SelectedTrack is null)
+        {
+            return false;
+        }
+
+        var selected = GetSelectedNotes().OrderBy(note => note.StartStep).ThenBy(note => note.Pitch).ToList();
+        if (selected.Count == 1)
+        {
+            return selected[0].IsSlurredToNext;
+        }
+
+        var selectedLinks = selected
+            .Select((note, index) => (note, next: selected.Skip(index + 1).FirstOrDefault(candidate => candidate.StartStep > note.StartStep)))
+            .Where(entry => entry.next is not null)
+            .ToList();
+
+        return selectedLinks.Count > 0 && selectedLinks.All(entry => entry.note.IsSlurredToNext &&
+            GetSlurTarget(SelectedTrack, entry.note) == entry.next);
+    }
+
+    private bool AreSelectedNotesTied()
+    {
+        if (SelectedTrack is null)
+        {
+            return false;
+        }
+
+        var selected = GetSelectedNotes().OrderBy(note => note.StartStep).ThenBy(note => note.Pitch).ToList();
+        if (selected.Count == 1)
+        {
+            return selected[0].IsTiedToNext;
+        }
+
+        var tiePairs = selected
+            .Select((note, index) => (note, next: selected.Skip(index + 1).FirstOrDefault(candidate => candidate.StartStep > note.StartStep)))
+            .Where(entry => entry.next is not null)
+            .ToList();
+
+        return tiePairs.Count > 0 && tiePairs.All(entry => entry.note.IsTiedToNext &&
+            GetTieTarget(SelectedTrack, entry.note) == entry.next && entry.note.Pitch == entry.next!.Pitch &&
+            entry.next.StartStep == entry.note.StartStep + entry.note.LengthSteps);
+    }
+
+    private static MusicalNote? GetSlurTarget(InstrumentTrack track, MusicalNote note)
+    {
+        if (note.SlurredToNoteId is Guid targetId)
+        {
+            return track.Notes.FirstOrDefault(candidate => candidate.Id == targetId);
+        }
+
+        if (!note.IsSlurredToNext)
+        {
+            return null;
+        }
+
+        return track.Notes
+            .Where(candidate => candidate.StartStep > note.StartStep)
+            .OrderBy(candidate => candidate.StartStep)
+            .ThenBy(candidate => candidate.Pitch)
+            .FirstOrDefault();
+    }
+
+    private static MusicalNote? GetTieTarget(InstrumentTrack track, MusicalNote note) =>
+        note.TiedToNoteId is Guid targetId
+            ? track.Notes.FirstOrDefault(candidate => candidate.Id == targetId)
+            : null;
+
+    private static (int Steps, HashSet<MusicalNote> Continuations, MusicalNote LastNote) GetTiedDuration(
+        InstrumentTrack track,
+        MusicalNote note)
+    {
+        var steps = note.LengthSteps;
+        var current = note;
+        var continuations = new HashSet<MusicalNote>();
+        var visited = new HashSet<MusicalNote> { note };
+        while (current.IsTiedToNext || (current.IsSlurredToNext && current.SlurredToNoteId is null))
+        {
+            var next = current.IsTiedToNext ? GetTieTarget(track, current) : GetSlurTarget(track, current);
+            if (next is null || next.Pitch != note.Pitch || next.StartStep != note.StartStep + steps || !visited.Add(next))
+            {
+                break;
+            }
+
+            steps += next.LengthSteps;
+            continuations.Add(next);
+            current = next;
+        }
+
+        return (steps, continuations, current);
+    }
+
+    private void RemoveInvalidTieLinks()
+    {
+        if (SelectedTrack is null)
+        {
+            return;
+        }
+
+        foreach (var note in SelectedTrack.Notes.Where(candidate => candidate.IsTiedToNext).ToList())
+        {
+            var target = GetTieTarget(SelectedTrack, note);
+            if (target is not null && target.Pitch == note.Pitch && target.StartStep == note.StartStep + note.LengthSteps)
+            {
+                continue;
+            }
+
+            note.TiedToNoteId = null;
+            note.IsTiedToNext = false;
         }
     }
 
@@ -1933,8 +2154,9 @@ public partial class MainWindow : Window
             if (note.LengthSteps < 16)
             {
                 var stemHeight = 36d;
-                var stemX = x + 6;
-                var stemTop = y - stemHeight;
+                var stemUp = IsStemUp(note);
+                var stemX = x + (stemUp ? 6 : -6);
+                var stemTop = stemUp ? y - stemHeight : y;
                 var stem = new Border { Width = 1.4, Height = stemHeight, Background = selected ? Brushes.SeaGreen : Brushes.Black, IsHitTestVisible = false };
                 Canvas.SetLeft(stem, stemX);
                 Canvas.SetTop(stem, stemTop);
@@ -1945,76 +2167,20 @@ public partial class MainWindow : Window
                 {
                     var flag = new System.Windows.Shapes.Path
                     {
-                        Data = Geometry.Parse("M 0,0 C 13,5 13,13 2,18"),
+                        Data = Geometry.Parse(stemUp ? "M 0,0 C 13,5 13,13 2,18" : "M 0,0 C -13,-5 -13,-13 -2,-18"),
                         Stroke = selected ? Brushes.SeaGreen : Brushes.Black,
                         StrokeThickness = 2,
                         IsHitTestVisible = false,
-                        RenderTransform = new TranslateTransform(stemX, stemTop + flagIndex * 7)
+                        RenderTransform = new TranslateTransform(stemX, stemUp ? stemTop + flagIndex * 7 : stemTop + stemHeight - flagIndex * 7)
                     };
                     ScoreCanvas.Children.Add(flag);
                 }
             }
         }
 
-        var orderedScoreNotes = SelectedTrack.Notes.OrderBy(note => note.StartStep).ToList();
-        foreach (var note in orderedScoreNotes.Where(note => note.IsSlurredToNext && notePositions.ContainsKey(note)))
-        {
-            var noteIndex = orderedScoreNotes.IndexOf(note);
-            var nextNote = noteIndex >= 0 && noteIndex + 1 < orderedScoreNotes.Count ? orderedScoreNotes[noteIndex + 1] : null;
-            if (nextNote is null || !notePositions.TryGetValue(nextNote, out var nextPosition))
-            {
-                continue;
-            }
-
-            var startPosition = notePositions[note];
-            if (nextPosition.X - startPosition.X < 16)
-            {
-                continue;
-            }
-
-            var goesToNextSystem = startPosition.System != nextPosition.System;
-            var start = new Point(startPosition.X + 5, startPosition.Y - 4);
-            var end = goesToNextSystem
-                ? new Point(ScorePageLeft - 6, nextPosition.Y - 4)
-                : new Point(nextPosition.X - 5, nextPosition.Y - 4);
-            var archY = Math.Min(start.Y, end.Y) - 22;
-            var curve = new System.Windows.Media.PathGeometry();
-            var figure = new System.Windows.Media.PathFigure { StartPoint = start, IsClosed = false };
-            figure.Segments.Add(new System.Windows.Media.BezierSegment(
-                new Point(start.X + (end.X - start.X) / 3, archY),
-                new Point(start.X + (end.X - start.X) * 2 / 3, archY),
-                end,
-                true));
-            curve.Figures.Add(figure);
-            ScoreCanvas.Children.Add(new System.Windows.Shapes.Path
-            {
-                Data = curve,
-                Stroke = Brushes.Black,
-                StrokeThickness = 1.5,
-                IsHitTestVisible = false
-            });
-
-            if (goesToNextSystem)
-            {
-                var continuationStart = new Point(ScorePageLeft - 2, nextPosition.Y - 4);
-                var continuationEnd = new Point(nextPosition.X - 5, nextPosition.Y - 4);
-                var continuationCurve = new System.Windows.Media.PathGeometry();
-                var continuationFigure = new System.Windows.Media.PathFigure { StartPoint = continuationStart, IsClosed = false };
-                continuationFigure.Segments.Add(new System.Windows.Media.BezierSegment(
-                    new Point(continuationStart.X + (continuationEnd.X - continuationStart.X) / 3, continuationStart.Y - 22),
-                    new Point(continuationStart.X + (continuationEnd.X - continuationStart.X) * 2 / 3, continuationStart.Y - 22),
-                    continuationEnd,
-                    true));
-                continuationCurve.Figures.Add(continuationFigure);
-                ScoreCanvas.Children.Add(new System.Windows.Shapes.Path
-                {
-                    Data = continuationCurve,
-                    Stroke = Brushes.Black,
-                    StrokeThickness = 1.5,
-                    IsHitTestVisible = false
-                });
-            }
-        }
+        var orderedScoreNotes = SelectedTrack.Notes.OrderBy(note => note.StartStep).ThenBy(note => note.Pitch).ToList();
+        RenderNoteConnectionCurves(orderedScoreNotes, notePositions, isTie: false);
+        RenderNoteConnectionCurves(orderedScoreNotes, notePositions, isTie: true);
 
         if (_playbackStopwatch.IsRunning)
         {
@@ -2022,11 +2188,108 @@ public partial class MainWindow : Window
         }
     }
 
+    private void RenderNoteConnectionCurves(
+        List<MusicalNote> orderedNotes,
+        Dictionary<MusicalNote, (double X, double Y, int System)> notePositions,
+        bool isTie)
+    {
+        bool HasLink(MusicalNote note) => isTie ? note.IsTiedToNext : note.IsSlurredToNext;
+        MusicalNote? GetTarget(MusicalNote note) => isTie
+            ? GetTieTarget(SelectedTrack!, note)
+            : GetSlurTarget(SelectedTrack!, note);
+
+        var participants = orderedNotes.Where(note => HasLink(note) || orderedNotes.Any(candidate =>
+            HasLink(candidate) && GetTarget(candidate) == note)).ToList();
+        var renderedNotes = new HashSet<MusicalNote>();
+        foreach (var participant in participants)
+        {
+            if (renderedNotes.Contains(participant))
+            {
+                continue;
+            }
+
+            var root = participant;
+            var reverseVisited = new HashSet<MusicalNote>();
+            while (reverseVisited.Add(root))
+            {
+                var previous = orderedNotes.FirstOrDefault(candidate => HasLink(candidate) && GetTarget(candidate) == root);
+                if (previous is null || reverseVisited.Contains(previous))
+                {
+                    break;
+                }
+
+                root = previous;
+            }
+
+            var chain = new List<MusicalNote> { root };
+            var chainSet = new HashSet<MusicalNote> { root };
+            while (HasLink(chain[^1]))
+            {
+                var next = GetTarget(chain[^1]);
+                if (next is null || !chainSet.Add(next))
+                {
+                    break;
+                }
+
+                chain.Add(next);
+            }
+
+            renderedNotes.UnionWith(chain);
+            var visibleChain = chain
+                .Select((note, chainIndex) => (note, chainIndex))
+                .Where(entry => notePositions.ContainsKey(entry.note))
+                .GroupBy(entry => notePositions[entry.note].System);
+
+            foreach (var systemGroup in visibleChain)
+            {
+                var systemNotes = systemGroup.OrderBy(entry => entry.chainIndex).ToList();
+                var first = systemNotes[0];
+                var last = systemNotes[^1];
+                var firstPosition = notePositions[first.note];
+                var lastPosition = notePositions[last.note];
+                var start = first.chainIndex == 0
+                    ? new Point(firstPosition.X + 5, firstPosition.Y - 4)
+                    : new Point(ScorePageLeft - 4, firstPosition.Y - 4);
+                var end = last.chainIndex == chain.Count - 1
+                    ? new Point(lastPosition.X - 5, lastPosition.Y - 4)
+                    : new Point(ScoreCanvas.Width - 4, lastPosition.Y - 4);
+                var upwardStems = systemNotes.Count(entry => IsStemUp(entry.note));
+                AddSlurCurve(start, end, upwardStems * 2 < systemNotes.Count, isTie);
+            }
+        }
+    }
+
+    private void AddSlurCurve(Point start, Point end, bool above, bool isTie)
+    {
+        if (end.X - start.X < 8)
+        {
+            return;
+        }
+
+        var archOffset = isTie ? 15 : 23;
+        var archY = above ? Math.Min(start.Y, end.Y) - archOffset : Math.Max(start.Y, end.Y) + archOffset;
+        var curve = new System.Windows.Media.PathGeometry();
+        var figure = new System.Windows.Media.PathFigure { StartPoint = start, IsClosed = false };
+        figure.Segments.Add(new System.Windows.Media.BezierSegment(
+            new Point(start.X + (end.X - start.X) / 3, archY),
+            new Point(start.X + (end.X - start.X) * 2 / 3, archY),
+            end,
+            true));
+        curve.Figures.Add(figure);
+        ScoreCanvas.Children.Add(new System.Windows.Shapes.Path
+        {
+            Data = curve,
+            Stroke = Brushes.Black,
+            StrokeThickness = 1.5,
+            IsHitTestVisible = false
+        });
+    }
+
     private void PianoRollNote_MouseRightButtonDown(object sender, MouseButtonEventArgs e)
     {
         if (SelectedTrack is not null && sender is FrameworkElement { DataContext: MusicalNote note })
         {
-            SelectedTrack.Notes.Remove(note);
+            RemoveScoreNote(note);
             _selectedNotes.Remove(note);
             if (ReferenceEquals(SelectedNote, note))
             {
@@ -2177,6 +2440,8 @@ public partial class MainWindow : Window
     }
 
     private static bool IsBlackKey(int pitch) => pitch % 12 is 1 or 3 or 6 or 8 or 10;
+
+    private static bool IsStemUp(MusicalNote note) => note.StemDirection != "Down";
 
     private static string GetPitchName(int pitch)
     {
